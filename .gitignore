@@ -11,3 +11,4 @@ data/docs_selected.jsonl
 logs/
 final_model.int8.ptz
 final_model.pt
+.claude/
