@@ -1,13 +1,149 @@
 # Parameter Golf - Optimization Notes & Scratchpad
 
-## Competition Rules
-- Train best LM fitting in 16MB artifact, trains in <10min on 8xH100
+## Competition Rules (from README, issue #677, issue #1017)
+
+### Core Constraints
+- Train best LM fitting in 16MB artifact, trains in <10min on 8xH100 (SXM variant)
 - Eval metric: val_bpb (bits per byte) on FineWeb validation set - LOWER is better
-- 10min training + **10min eval** time limit (TTT + sliding eval must fit in 10min)
+- **10min training** + **10min eval** (two separate 10-min budgets)
 - Our hardware: 4x A100 80GB (competition uses 8xH100)
 - Tokenizer: fineweb_1024_bpe.model (SP, vocab_size=1024) - CANNOT change
 - Dataset: fineweb10B_sp1024 - CANNOT change
-- Artifact = code bytes + compressed model bytes < 16,000,000 bytes
+- Challenge runs March 18 to April 30, 2026
+
+### Artifact Size Rules
+- Artifact = code bytes + compressed model bytes < **16,000,000 bytes** (decimal 16MB, NOT 16 MiB/16,777,216)
+- All counted code should live in the `train_gpt.py` script
+- No external downloads, training dataset access, or network calls during evaluation
+- Artifact must be fully self-contained and reproducible
+- External libraries (PyTorch, FlashAttention, etc.) permitted, don't count toward 16MB
+
+### Compute Budget Rules
+- Training: at most 10 minutes on 8×H100 SXM GPUs
+- Evaluation: at most 10 minutes **additional** on the same hardware
+- **No compute may be transferred between phases**
+- Procedures that consume data to modify model state (e.g. GPTQ/Hessian calibration) belong
+  to the **training** budget. Performing them during evaluation is **not permitted**.
+- Common violation: people train for full 10min, then do GPTQ calibration (4-40s), then 10min
+  eval — this is illegal because GPTQ calibration is training-phase compute
+
+### Four Conditions for Valid val_bpb (from issue #1017, NoesisGenesis)
+
+These are jointly necessary and sufficient for val_bpb to be a valid information-theoretic
+measure (prequential code length of a causal predictor).
+
+**Condition 1 (Strict causal dependence)**: At position t, the predictive distribution
+p_t(·) must be a function only of the submitted artifact A and the strict prefix
+x_1, …, x_{t−1}. It may not depend on x_t or any future token, on any statistic computed
+from future validation tokens, or on any external data not already encoded in A.
+
+**Condition 2 (Full normalized distribution)**: Before x_t is scored, the submission must
+define a single full probability distribution over the official token alphabet Σ. For every
+a ∈ Σ, p_t(a) ≥ 0 and ∑ p_t(a) = 1. This distribution must be determined independently
+of which token is realized at position t. It may NOT be constructed by evaluating only
+the realized token and filling in remaining mass. Normalization must hold over actual
+tokens, not over internal buckets, hash bins, or other latent structures.
+
+**Condition 3 (Score-before-update)**: The score at position t is computed from p_t(x_t).
+Only AFTER that score is fixed may state be updated using x_t. The current symbol may not
+influence its own assigned probability, directly or indirectly.
+
+**Condition 4 (Single left-to-right pass)**: Evaluation consists of exactly one left-to-right
+pass. No rescoring, no second pass, no retrospective revision of earlier probabilities,
+no selection among multiple executions based on observed validation outcomes.
+
+### Two Tracks (from issue #1017)
+
+**Track A — Fixed Predictor**: Model is trained, then evaluated. During evaluation, no model
+state is updated from validation tokens. Score measures quality of a fixed predictor.
+- Permitted: sliding-window attention, KV-cache strategies, inference optimizations
+- Not permitted: eval-built n-gram caches, TTT, adaptive mixing from eval statistics
+
+**Track B — Adaptive Compression**: Model may adapt state during eval using previously
+scored tokens. Measures how good the predictor is at becoming better while predicting.
+- Permitted: Score-first TTT (score chunk → train on it), per-document LoRA with
+  score-before-update discipline, causal n-gram caches from already-scored tokens
+- Not permitted: Score-after-adapt TTT (adapt then score same tokens), multi-pass
+  rescoring, cache state at position t reflecting tokens at or beyond t
+
+All four conditions apply to BOTH tracks.
+
+### Common Violation Patterns (from issue #1017, Section VI)
+
+| Pattern | Violates | Why |
+|---------|----------|-----|
+| Eval-built n-gram cache with state at t reflecting tokens ≥ t | Cond 1 | Future tokens influence current prediction |
+| Two-pass full rescore | Cond 1, 4 | Second pass uses state from tokens after each scored position |
+| Score-after-adapt TTT (adapt on chunk, then score same chunk) | Cond 3 | Current tokens influence their own probabilities |
+| Oracle selection via min() across passes | Cond 4 | Multiple executions, selection on observed outcomes |
+| Entropy expert in context mixer (scalar of neural dist, not a dist over Σ) | Cond 2 | Mixed result is not a normalized distribution over Σ |
+| Hardcoded bytes-per-token constant | — | Incorrect metric (equally fatal) |
+
+### Explicitly Invalid Patterns (from issue #677)
+
+**Invalid TTT (closed PRs):**
+- #410, #415, #417: two-phase/multi-epoch adaptation on validation, then reported score after
+- #442, #462, #481, #486, #517, #518, #532, #555, #581, #595: adapt on validation before eval
+- #512, #548, #568: multi-epoch TTT reports final-pass/final-epoch score after earlier adaptation
+- #576: re-scores full validation set after TTT with fully adapted model
+- #684: multi-epoch TTT trains on eval tokens, takes loss at last epoch
+
+**Invalid eval (closed PRs):**
+- #535, #544, #545, #569, #585, #593, #606, #615, #626, #639, #674: GPTQ/Hessian calibration
+  uses fineweb_train_* during evaluation (this is training-phase compute, not eval)
+- #573: oracle/hindsight min() selection across multiple passes
+- #659: checks NLL of both model and 5-gram and picks lower — uses knowledge of true token
+
+**Invalid n-gram caches (mass closure):**
+- Hashed n-gram caches that aren't properly normalized over the full token alphabet
+- The hash bucket implementation creates correlations/collisions requiring re-normalization
+- Without proper normalization: sum_i P_ngram(token_i | context) >> 1, making BPB invalid
+- "No sub-1.0 submission survives" under proper normalization rules (NoesisGenesis)
+- Properly normalized n-gram BPB (from mhuen, built on 200M tokens, no hashing):
+  1-gram: ~3.48, 2-gram: ~2.45, 3-gram: ~1.87, 4-gram: ~1.70
+- Many PRs closed: #846, #868, #869, #870, #881, #888, #893, #907, #921, etc.
+- valerio-oai: no new submissions merged; reviewing only PRs after #988 going forward
+
+### Evaluation Correctness (from issue #1017)
+
+- **val_bpb is bits per byte, NOT bits per token**
+  - Must compute per-token byte lengths from sentencepiece vocabulary
+  - Account for ▁ (U+2581) leading space (1 byte, part of piece string)
+  - Account for byte fallback tokens (exactly 1 byte each)
+  - Exclude boundary tokens (BOS, EOS, UNK, control) which encode 0 bytes
+  - Use `build_sentencepiece_luts()` for lookup tables
+  - `val_bpb = (total_cross_entropy_nats / log(2)) * (token_count / byte_count)`
+  - Do NOT use hardcoded constants like `val_loss / (log(2) * 3.5)`
+- **Evaluate on ALL validation shards** (fineweb_val_*.bin), not just first one
+- **Train on ALL training shards**, not just first one
+- **Do NOT reorder the validation set** — default shard/token order must be preserved
+
+### Submission Requirements
+- Must beat existing SOTA by ≥0.005 nats at p < 0.01
+- Provide training logs from at least 3 independent runs (different seeds)
+- PRs reviewed chronologically by creation time
+- Pure systems optimizations exempt from 0.005-nats threshold
+- PR adds new folder to `/records/track_10min_16mb/[date]_[description]/` with:
+  1. `train_gpt.py` — compilable and runnable from records folder
+  2. `README.md` — methodology and results
+  3. `submission.json` — name, GitHub ID, val_bpb, metadata
+  4. Training logs from 3+ seeds
+  5. `requirements.txt` for any additional packages
+- Tokenizer/dataset changes require proof of correct val_bpb calculation
+- Seed brute-forcing or offline validation-set optimization → disqualification
+- If submission does not beat rank 1, submit under `track_non_record_16mb` instead
+
+### ⚠️ Example Compliance Issues (as of Exp 63)
+1. **TTT trains on unevaluated tokens** — We do full-weight SGD on ALL val tokens BEFORE
+   evaluating. Violates Conditions 3 and 4. Must switch to **score-first TTT** (Track B):
+   score a chunk → lock in loss → train on scored chunk → next chunk.
+2. **Eval time exceeds 10 min** — Our TTT (120ep × ~21s/ep ≈ 42min) + sliding eval (~190s)
+   ≈ 45min total. Must fit all eval-time compute (including TTT) within 600s on 8xH100.
+3. **Need 3-seed validation** — Must show p<0.01 with 3+ seeds.
+4. **GPTQ/Hessian calibration**: If any calibration uses training data during eval phase,
+   that's invalid. Must ensure all calibration happens within training budget.
+5. **val_bpb computation**: Must verify we use proper byte-level BPB with sentencepiece
+   lookup tables, not hardcoded constants.
 
 ## Competition Landscape (as of 2026-03-25)
 
@@ -332,16 +468,37 @@ bottleneck is compute, not overhead. Not worth the fewer gradient updates.
 | **57** | **1.278** | **1.0312** | **120ep warmup=90 + SWA (BEST)** |
 | 58  | 1.278     | 1.0313         | 150ep warmup=112 + SWA (plateau) |
 
+### Session 7: TTT LR Sweep (Exp 59-63, NON-COMPLIANT offline TTT)
+
+**Note**: These experiments use offline TTT (train on all val before eval), which violates
+competition rules. The absolute numbers are not competition-valid, but the LR findings
+are useful for calibrating online TTT.
+
+| Exp | TTT LR | val_bpb | Delta from LR=1.0 |
+|-----|--------|---------|-------------------|
+| 59  | 1.0    | 1.0269  | baseline          |
+| 60  | 1.1    | 1.0244  | -0.0025           |
+| 61  | 1.2    | 1.0230  | -0.0039           |
+| 62  | 1.3    | 1.0202  | -0.0067           |
+| **63** | **1.5** | **1.0173** | **-0.0096** |
+
+**Finding**: Higher TTT LR keeps improving with warmup+SWA. LR=1.5 best so far.
+Each 0.1 LR step gives diminishing but positive improvement.
+The warmup prevents divergence at high LRs that previously failed (LR=1.0 diverged without warmup).
+
 ## Key Insight: Gap to Sub-1.0
 - Pre-quant val_bpb (1310 steps, 4xA100): 1.278
 - Post-quant int8 gap: +0.035 → 1.313
-- Best TTT improvement (120ep+warmup+SWA): -0.282 → **val_bpb=1.0312**
-- On 8xH100 (~7000 steps): pre-quant ~1.16-1.18
-- With ~19 TTT epochs + warmup + SWA: estimated ~0.93-0.95 → **well under 1.0!**
-- TTT improvement scales with epochs but saturates at ~120ep on 4xA100
+- Best TTT improvement (120ep+warmup+SWA, LR=1.5): -0.296 → **val_bpb=1.0173** (NON-COMPLIANT)
+- **Must switch to online TTT (score-first) for competition compliance**
+- Online TTT will likely give less improvement than offline TTT (fewer total gradient steps)
+- On 8xH100 (~7000 steps): pre-quant ~1.16-1.18, int8 fits may be an issue
 
 ## Next Steps / Ideas
-1. **Verify int8 fits on 8xH100** — if not, need int6 or mixed int6/int8
-2. **Full Hessian GPTQ** — PR #593 shows -0.022 bpb over GPTQ-lite
-3. **Wider model dim** — 576 or 640 instead of 512, fewer layers to compensate
-4. **Improve pre-quant quality** — architecture changes, training improvements
+1. **CRITICAL: Implement online/score-first TTT** — evaluate each chunk, then train on it
+   - Must fit within 10min eval budget on 8xH100
+   - Model: score window → accumulate BPB → train on scored window → next window
+2. **Verify int8 fits on 8xH100** — if not, need int6 or mixed int6/int8
+3. **Full Hessian GPTQ** — PR #593 shows -0.022 bpb over GPTQ-lite
+4. **Wider model dim** — 576 or 640 instead of 512, fewer layers to compensate
+5. **Improve pre-quant quality** — architecture changes, training improvements
