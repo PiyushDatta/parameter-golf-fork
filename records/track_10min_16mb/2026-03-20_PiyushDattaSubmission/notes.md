@@ -1,3 +1,6 @@
+## TEMP NOTES: Piyush Datta
+baseline uses u-net/skip connections, can we do better? put router in middle, deeper layers send to router, router gives back residuals from earlier layers - but router decides
+
 # Parameter Golf - Optimization Notes & Scratchpad
 
 ## Competition Rules (from README, issue #677, issue #1017)
