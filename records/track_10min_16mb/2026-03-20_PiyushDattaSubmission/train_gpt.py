@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import sentencepiece as spm
+import struct
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -51,12 +52,12 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 600))  # 3500 for 8xH100, 600 for 4xA100
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))  # PR #1125: monotonic improvement 1.5→4.0
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -64,6 +65,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", 0.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -78,16 +80,18 @@ class Hyperparameters:
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
+    embed_beta1 = float(os.environ.get("EMBED_BETA1", 0.7))  # lower momentum for embeddings
+    head_beta1 = float(os.environ.get("HEAD_BETA1", 0.7))  # lower momentum for lm_head
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
@@ -108,12 +112,12 @@ class Hyperparameters:
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
-    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "0")))
-    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
-    swa_every = int(os.environ.get("SWA_EVERY", 50))
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.7))  # start SWA when scale < 0.7 (covers ~last 100 steps)
+    swa_every = int(os.environ.get("SWA_EVERY", 5))
 
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.85))
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.40))  # even earlier QAT for more steps
     prune_frac = float(os.environ.get("PRUNE_FRAC", 0.03))
 
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
@@ -121,11 +125,12 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
 
     eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 1.0))
-    quant_bits = int(os.environ.get("QUANT_BITS", 8))  # 6 = int6 (clip_range=31), 8 = int8 (clip_range=127)
+    quant_bits = int(os.environ.get("QUANT_BITS", 6))  # 6 = int6 (clip_range=31), 8 = int8 (clip_range=127)
     gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "1")))  # Full Hessian GPTQ quantization
     gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     gptq_damp_factor = float(os.environ.get("GPTQ_DAMP_FACTOR", 0.01))
+    mixed_precision = bool(int(os.environ.get("MIXED_PRECISION", "0")))  # int5/6/7 per-group based on Hessian
 
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_mode = os.environ.get("TTT_MODE", "score_first")  # "score_first" (compliant), "full", "twophase", or "adam"
@@ -136,22 +141,50 @@ class Hyperparameters:
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
     ttt_weight_decay = float(os.environ.get("TTT_WEIGHT_DECAY", 0.0))
 
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    a, b, c = (3.4445, -4.7750, 2.0315)
+# Polar Express optimal degree-5 coefficients (Amsel et al., arXiv:2505.16932)
+# With AOL preconditioning we skip iter 1 (AOL already contracts singular values)
+_POLAR_COEFFS_AOL = [
+    (4.107059111542203,  -2.9478499167379106,  0.5448431082926601),  # iter 2
+    (3.9486908534822946, -2.908902115962949,   0.5518191394370137),  # iter 3
+    (3.3184196573706015, -2.488488024314874,   0.51004894012372),    # iter 4
+    (2.300652019954817,  -1.6689039845747493,  0.4188073119525673),  # iter 5
+    (1.891301407787398,  -1.2679958271945868,  0.37680408948524835), # iter 6
+    (1.875, -1.25, 0.375),  # iter 7+: converged fixed point
+]
+
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
+    """Turbo-Muon: Newton-Schulz with left-Gram AOL + Polar Express coefficients."""
     X = G.bfloat16()
-    X /= X.norm() + eps
-    transposed = G.size(0) > G.size(1)
+    transposed = X.size(0) > X.size(1)
     if transposed:
         X = X.T
-    for _ in range(steps):
-        A = X @ X.T
+    # AOL preconditioning: Gershgorin row-sum scaling from X@X.T
+    A = X @ X.T
+    s = 1.0 / (A.abs().sum(dim=1).sqrt() + eps)
+    X = s.unsqueeze(1) * X
+    A = s.unsqueeze(0) * A * s.unsqueeze(1)
+    for i in range(steps):
+        a, b, c = _POLAR_COEFFS_AOL[min(i, len(_POLAR_COEFFS_AOL) - 1)]
+        if i > 0:
+            A = X @ X.T
         B = b * A + c * A @ A
         X = a * X + B @ X
     return X.T if transposed else X
+
+
+def _post_ns_normalize(X: Tensor, mode: str = "row_col") -> Tensor:
+    """Post-NS normalization: equalize per-neuron update magnitudes."""
+    if mode in ("row", "row_col"):
+        X = X / (X.float().norm(dim=-1, keepdim=True).to(X.dtype) + 1e-7)
+    if mode in ("col", "row_col"):
+        X = X / (X.float().norm(dim=-2, keepdim=True).to(X.dtype) + 1e-7)
+    return X
 
 
 class Muon(torch.optim.Optimizer):
@@ -195,7 +228,7 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    g = _post_ns_normalize(g, mode="row_col")
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
 
@@ -342,6 +375,40 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
+_BSHF_MAGIC = b"BSHF"
+
+def _byte_shuffle(data: bytes, stride: int = 2) -> bytes:
+    """Transpose byte stream by stride to improve compression.
+    Groups byte[i % stride] together (e.g. high/low bytes of float16)."""
+    if stride <= 1 or len(data) < stride:
+        return data
+    src = np.frombuffer(data, dtype=np.uint8)
+    n = len(src)
+    out = np.empty(n, dtype=np.uint8)
+    dest_off = 0
+    for pos in range(stride):
+        chunk = src[pos::stride]
+        out[dest_off:dest_off + len(chunk)] = chunk
+        dest_off += len(chunk)
+    return _BSHF_MAGIC + bytes([stride]) + out.tobytes()
+
+def _byte_unshuffle(data: bytes) -> bytes:
+    """Inverse of _byte_shuffle."""
+    if len(data) < 5 or data[:4] != _BSHF_MAGIC:
+        return data
+    stride = data[4]
+    if stride < 2:
+        return data[5:]
+    payload = np.frombuffer(data, dtype=np.uint8, offset=5)
+    n = len(payload)
+    out = np.empty(n, dtype=np.uint8)
+    src_off = 0
+    for pos in range(stride):
+        chunk_len = n // stride + (1 if pos < n % stride else 0)
+        out[pos::stride][:chunk_len] = payload[src_off:src_off + chunk_len]
+        src_off += chunk_len
+    return out.tobytes()
+
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
@@ -461,8 +528,75 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31, hessian: Tensor | Non
             best_q, best_s, best_err = q, s, err
     return best_q, best_s
 
+_MP_BYTES_PER_PARAM_INT5 = 0.46
+_MP_COST_PER_EXTRA_BIT = 0.24
+_MP_NON_WEIGHT_COMPRESS = 0.55
+
+def _allocate_bits_mixed(hessians, state_dict, target_bytes=16_000_000, code_bytes=0):
+    """Allocate int5-int7 per tensor group based on Hessian sensitivity."""
+    group_traces = {}
+    group_numel = {}
+    tensor_to_group = {}
+    for name, H in hessians.items():
+        trace_val = float(torch.trace(H).item()) / H.shape[0]
+        pname = name.replace(".weight", "")
+        if not pname.startswith("blocks."):
+            continue
+        dot2 = pname.index(".", 7)
+        layer_idx = int(pname[7:dot2])
+        gtype = "attn" if ".attn." in pname else "mlp" if ".mlp." in pname else "other"
+        gkey = f"layer.{layer_idx}.{gtype}"
+        group_traces.setdefault(gkey, []).append(trace_val)
+        tensor_to_group[pname] = gkey
+        w = state_dict.get(pname)
+        if w is not None:
+            group_numel[gkey] = group_numel.get(gkey, 0) + w.numel()
+    group_sensitivity = {k: sum(v) / len(v) for k, v in group_traces.items()}
+    ranked = sorted(group_sensitivity.items(), key=lambda x: x[1], reverse=True)
+
+    total_quant_numel = sum(group_numel.values())
+    non_weight_raw = sum(
+        t.numel() * t.element_size() for name, t in state_dict.items()
+        if name not in {tn for tn in tensor_to_group}
+    )
+    base_estimate = code_bytes + int(non_weight_raw * _MP_NON_WEIGHT_COMPRESS) + int(total_quant_numel * _MP_BYTES_PER_PARAM_INT5)
+    budget = int(target_bytes * 0.98) - base_estimate  # 2% headroom
+
+    group_bits = {gkey: 5 for gkey, _ in ranked}
+    estimated_extra = 0
+    if budget > 0:
+        # Pass 1: try int7 for top group
+        if ranked:
+            top_gkey = ranked[0][0]
+            top_numel = group_numel.get(top_gkey, 0)
+            cost_int7 = int(top_numel * _MP_COST_PER_EXTRA_BIT * 2)
+            cost_int6 = int(top_numel * _MP_COST_PER_EXTRA_BIT)
+            if top_numel > 0 and cost_int7 <= budget:
+                group_bits[top_gkey] = 7
+                estimated_extra += cost_int7
+            elif top_numel > 0 and cost_int6 <= budget:
+                group_bits[top_gkey] = 6
+                estimated_extra += cost_int6
+        # Pass 2: promote remaining to int6
+        for gkey, _ in ranked:
+            if group_bits[gkey] > 5:
+                continue
+            numel = group_numel.get(gkey, 0)
+            if numel == 0:
+                continue
+            cost = int(numel * _MP_COST_PER_EXTRA_BIT)
+            if estimated_extra + cost <= budget:
+                group_bits[gkey] = 6
+                estimated_extra += cost
+
+    bit_allocation = {}
+    for tname, gkey in tensor_to_group.items():
+        bit_allocation[tname] = group_bits[gkey]
+    return bit_allocation, [(gkey, group_bits[gkey], group_sensitivity[gkey]) for gkey, _ in ranked]
+
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip_range: int = 31,
-                         hessians: dict[str, Tensor] | None = None, block_size: int = 128, damp_factor: float = 0.01):
+                         hessians: dict[str, Tensor] | None = None, block_size: int = 128, damp_factor: float = 0.01,
+                         bit_allocation: dict[str, int] | None = None):
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     gptq_count = 0
@@ -482,13 +616,15 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip
             meta[name] = "passthrough_fp16"
             continue
         if cat in int6_cats and t.ndim >= 1:
+            bits = bit_allocation.get(name, 6) if bit_allocation else 6
+            cr = {5: 15, 6: 31, 7: 63, 8: 127}.get(bits, clip_range)
             h = hessians.get(name + ".weight", hessians.get(name)) if hessians else None
-            q, s = quantize_int6_per_row(t, clip_range=clip_range, hessian=h, block_size=block_size, damp_factor=damp_factor)
+            q, s = quantize_int6_per_row(t, clip_range=cr, hessian=h, block_size=block_size, damp_factor=damp_factor)
             if h is not None:
                 gptq_count += 1
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+            meta[name] = {"type": f"int{bits}"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -637,6 +773,8 @@ class RMSNorm(nn.Module):
 class CastedLinear(nn.Linear):
     _qat: bool = False
     _qat_clip_range: int = 31  # int6=31, int8=127
+    _qat_soft_round: bool = False
+    _qat_soft_alpha: Tensor = None  # type: ignore[assignment]
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
@@ -645,9 +783,20 @@ class CastedLinear(nn.Linear):
             w_f = w.float()
             amax = w_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
             scale = amax / cr
-            q = (w_f / scale).round().clamp(-cr, cr)
-            w_q = q * scale
-            w = w + (w_q - w_f).detach()  # STE: grad flows through original w
+            if self._qat_soft_round and CastedLinear._qat_soft_alpha is not None:
+                # Soft-round: sigmoid approximation gives real gradients
+                w_scaled = w_f / scale
+                w_clamped = w_scaled.clamp(-cr, cr)
+                w_floor = w_clamped.detach().floor()
+                frac = w_clamped - w_floor
+                alpha = CastedLinear._qat_soft_alpha
+                soft = w_floor + torch.sigmoid(alpha * (frac - 0.5))
+                w = (soft * scale).to(x.dtype)
+            else:
+                # STE fallback
+                q = (w_f / scale).round().clamp(-cr, cr)
+                w_q = q * scale
+                w = w + (w_q - w_f).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
 
@@ -801,22 +950,23 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    def __init__(self, dim: int, mlp_mult: float, leaky_relu_slope: float = 0.5):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.leaky_relu_slope = leaky_relu_slope
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.3)
+        x = F.leaky_relu(self.fc(x), negative_slope=self.leaky_relu_slope)
         return self.proj(x.square())
 
 
 class MoEMLP(nn.Module):
     """Mixture of 2 Experts MLP with top-1 routing. torch.compile-friendly.
     Computes both experts explicitly (no einsum/loops), selects via mask."""
-    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2):
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int = 2, leaky_relu_slope: float = 0.5):
         super().__init__()
         self.num_experts = 2  # hardcoded to 2 for simplicity + compile
         hidden = int(mlp_mult * dim)
@@ -828,6 +978,7 @@ class MoEMLP(nn.Module):
         self.proj1._zero_init = True
         self.proj2._zero_init = True
         self._aux_loss = 0.0
+        self.leaky_relu_slope = leaky_relu_slope
 
     def forward(self, x: Tensor) -> Tensor:
         # Gate: top-1 routing between 2 experts
@@ -842,8 +993,8 @@ class MoEMLP(nn.Module):
         self._aux_loss = 2.0 * (frac_0 * avg_prob[0] + frac_1 * avg_prob[1])
 
         # Compute both experts (no branching)
-        h1 = self.proj1(F.leaky_relu(self.fc1(x), negative_slope=0.3).square())
-        h2 = self.proj2(F.leaky_relu(self.fc2(x), negative_slope=0.3).square())
+        h1 = self.proj1(F.leaky_relu(self.fc1(x), negative_slope=self.leaky_relu_slope).square())
+        h2 = self.proj2(F.leaky_relu(self.fc2(x), negative_slope=self.leaky_relu_slope).square())
 
         # Select via mask (top-1 hard routing with STE)
         mask = (top_idx == 0).unsqueeze(-1).to(x.dtype)  # [B, T, 1]
@@ -952,7 +1103,8 @@ class Block(nn.Module):
                  rope_base: float, qk_gain_init: float, layer_idx: int = 0,
                  rope_dims: int = 0, value_residual: bool = False,
                  gated_attention: bool = False, use_xsa: bool = False,
-                 use_moe: bool = False, moe_num_experts: int = 2):
+                 use_moe: bool = False, moe_num_experts: int = 2,
+                 leaky_relu_slope: float = 0.5):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
@@ -962,9 +1114,9 @@ class Block(nn.Module):
                                          gated_attention=gated_attention,
                                          use_xsa=use_xsa)
         if use_moe:
-            self.mlp = MoEMLP(dim, mlp_mult, num_experts=moe_num_experts)
+            self.mlp = MoEMLP(dim, mlp_mult, num_experts=moe_num_experts, leaky_relu_slope=leaky_relu_slope)
         else:
-            self.mlp = MLP(dim, mlp_mult)
+            self.mlp = MLP(dim, mlp_mult, leaky_relu_slope=leaky_relu_slope)
         self.use_moe = use_moe
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1011,6 +1163,7 @@ class GPT(nn.Module):
         engram_heads: int = 2,
         engram_orders: int = 2,
         engram_dim_per_head: int = 32,
+        leaky_relu_slope: float = 0.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1047,6 +1200,7 @@ class GPT(nn.Module):
                 layer_idx=i, rope_dims=rope_dims, value_residual=value_residual,
                 gated_attention=gated_attention, use_xsa=use_xsa,
                 use_moe=use_moe_here, moe_num_experts=moe_num_experts,
+                leaky_relu_slope=leaky_relu_slope,
             ))
         # VE128: value embedding that injects token identity into V at specific layers
         kv_dim = num_kv_heads * (model_dim // num_heads)
@@ -1715,6 +1869,7 @@ def main() -> None:
         engram_heads=args.engram_heads,
         engram_orders=args.engram_orders,
         engram_dim_per_head=args.engram_dim_per_head,
+        leaky_relu_slope=args.leaky_relu_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1758,7 +1913,7 @@ def main() -> None:
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
-        betas=(args.beta1, args.beta2),
+        betas=(args.embed_beta1, args.beta2),
         eps=args.adam_eps,
         weight_decay=args.weight_decay,
         fused=True,
@@ -1783,7 +1938,7 @@ def main() -> None:
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
+            betas=(args.head_beta1, args.beta2),
             eps=args.adam_eps,
             fused=True,
         )
@@ -1813,16 +1968,23 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
+    lr_floor = float(os.environ.get("LR_FLOOR", 0.05))  # never decay below 5% of peak
+    sqrt_cooldown = bool(int(os.environ.get("SQRT_COOLDOWN", "1")))  # sqrt(raw) holds LR higher longer
+
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            raw = max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+        else:
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            raw = remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+        if sqrt_cooldown and raw < 1.0:
+            raw = math.sqrt(raw)  # holds LR higher longer during warmdown
+        return max(raw, lr_floor)
 
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
@@ -1936,15 +2098,26 @@ def main() -> None:
         # Late QAT: enable fake-quantization in CastedLinear after qat_start_frac of wallclock
         if args.qat_enabled and not qat_activated and approx_training_time_ms > args.qat_start_frac * args.max_wallclock_seconds * 1000:
             qat_activated = True
+            qat_start_step = step
             qat_cr = {6: 31, 8: 127}[args.quant_bits]
             for m in base_model.modules():
                 if isinstance(m, CastedLinear):
                     m._qat = True
                     m._qat_clip_range = qat_cr
-            log0(f"qat:enabled at step:{step} time:{approx_training_time_ms:.0f}ms clip_range:{qat_cr}")
+                    m._qat_soft_round = True
+            CastedLinear._qat_soft_alpha = torch.tensor(1.0, device=device)
+            # Estimate total QAT steps
+            step_ms = approx_training_time_ms / max(step, 1)
+            qat_total_steps = max(int((args.max_wallclock_seconds * 1000 - approx_training_time_ms) / max(step_ms, 1e-9)), 1)
+            log0(f"qat:enabled at step:{step} time:{approx_training_time_ms:.0f}ms clip_range:{qat_cr} soft_round=True est_steps:{qat_total_steps}")
+        elif qat_activated and CastedLinear._qat_soft_round:
+            # Ramp soft-round alpha from 1 to 16 over QAT phase
+            qat_progress = min((step - qat_start_step) / max(qat_total_steps, 1), 1.0)
+            with torch.no_grad():
+                CastedLinear._qat_soft_alpha.fill_(1.0 + 15.0 * qat_progress)
 
-        # SWA: collect checkpoints during warmdown (disabled when EMA is on)
-        if args.swa_enabled and not args.ema_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+        # SWA: collect checkpoints during warmdown (runs alongside EMA)
+        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
@@ -1977,19 +2150,19 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply EMA or SWA
-    if args.ema_enabled and ema_state is not None:
-        log0("ema:applying EMA weights")
-        current_state = base_model.state_dict()
-        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-        base_model.load_state_dict(avg_state, strict=True)
-    elif args.swa_enabled and swa_state is not None and swa_count > 1:
+    # Apply SWA (preferred) or EMA
+    if args.swa_enabled and swa_state is not None and swa_count > 1:
         log0(f"swa:applying averaged {swa_count} checkpoints")
         current_state = base_model.state_dict()
         avg_state = {
             name: (tensor / swa_count).to(dtype=current_state[name].dtype)
             for name, tensor in swa_state.items()
         }
+        base_model.load_state_dict(avg_state, strict=True)
+    elif args.ema_enabled and ema_state is not None:
+        log0("ema:applying EMA weights")
+        current_state = base_model.state_dict()
+        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
 
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -2023,13 +2196,20 @@ def main() -> None:
     # INT6 mixed quantization + zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     quant_clip_range = {6: 31, 8: 127}[args.quant_bits]
+    bit_alloc = None
+    if args.mixed_precision and hessians:
+        code_bytes = len(code.encode("utf-8"))
+        bit_alloc, alloc_log = _allocate_bits_mixed(hessians, sd_cpu, target_bytes=16_000_000, code_bytes=code_bytes)
+        for gkey, bits, sens in alloc_log:
+            log0(f"  mixed_precision: {gkey} -> int{bits} (sensitivity={sens:.4f})")
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"}, clip_range=quant_clip_range,
                                                     hessians=hessians, block_size=args.gptq_block_size,
-                                                    damp_factor=args.gptq_damp_factor)
+                                                    damp_factor=args.gptq_damp_factor, bit_allocation=bit_alloc)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, 9)
+    quant_raw_shuffled = _byte_shuffle(quant_raw, stride=2)
+    quant_blob = zlib.compress(quant_raw_shuffled, 9)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
@@ -2042,7 +2222,7 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    decompressed = zlib.decompress(quant_blob_disk)
+    decompressed = _byte_unshuffle(zlib.decompress(quant_blob_disk))
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
     # Log quantization MSE
