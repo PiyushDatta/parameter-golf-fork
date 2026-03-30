@@ -59,10 +59,13 @@ def detect_gpu_count() -> int:
     return 1
 
 
-def get_train_cmd(nproc: int) -> list[str]:
+DEFAULT_SCRIPT = str(SCRIPT_DIR / "train_gpt.py")
+
+
+def get_train_cmd(nproc: int, script: str = None) -> list[str]:
     return [
         "torchrun", "--standalone", f"--nproc_per_node={nproc}",
-        str(SCRIPT_DIR / "train_gpt.py"),
+        script or DEFAULT_SCRIPT,
     ]
 
 
@@ -88,7 +91,8 @@ def find_checkpoint_value(records: list, target_ms: int):
 
 def run_training(extra_env: dict = None, name: str = "baseline",
                  baseline: dict = None, early_stop: bool = True,
-                 ttt_enabled: bool = False, nproc: int = None):
+                 ttt_enabled: bool = False, nproc: int = None,
+                 script: str = None):
     """Run training, parse output, optionally early-stop."""
     if nproc is None:
         nproc = detect_gpu_count()
@@ -101,10 +105,11 @@ def run_training(extra_env: dict = None, name: str = "baseline",
     if extra_env:
         env.update(extra_env)
 
-    train_cmd = get_train_cmd(nproc)
+    train_cmd = get_train_cmd(nproc, script)
 
     print(f"\n{'='*70}")
     print(f"  Experiment: {name}")
+    print(f"  Script: {script or DEFAULT_SCRIPT}")
     print(f"  GPUs: {nproc}")
     print(f"  Extra env: {extra_env or {}}")
     print(f"  Early stop: {early_stop} (baseline: {'loaded' if baseline else 'none'})")
@@ -225,6 +230,8 @@ def main():
     parser.add_argument("--show-baseline", action="store_true", help="Show saved baseline values")
     parser.add_argument("--nproc", type=int, default=None,
                         help="Number of GPUs (auto-detected if omitted)")
+    parser.add_argument("--script", type=str, default=None,
+                        help="Path to train_gpt.py script (default: same dir as this file)")
     args = parser.parse_args()
 
     nproc = args.nproc or detect_gpu_count()
@@ -253,7 +260,7 @@ def main():
     if args.baseline:
         print("Running BASELINE training (no TTT during training, standard config)...")
         checkpoint_map, final_bpb, records = run_training(
-            name="baseline", early_stop=False, nproc=nproc
+            name="baseline", early_stop=False, nproc=nproc, script=args.script
         )
         # Save baseline
         BASELINE_FILE.write_text(json.dumps(checkpoint_map, indent=2))
@@ -275,6 +282,7 @@ def main():
             baseline=baseline,
             early_stop=not args.no_early_stop,
             nproc=nproc,
+            script=args.script,
         )
 
         # Save experiment results

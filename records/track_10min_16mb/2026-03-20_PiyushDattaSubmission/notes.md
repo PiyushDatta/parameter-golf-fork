@@ -665,11 +665,100 @@ Using env vars: TTT_ENABLED=1 TTT_OPTIMIZER=sgd TTT_LR=X TTT_EPOCHS=Y TTT_CHUNK_
 - The baseline without TTT gets 1.2244 — TTT is currently HURTING performance
 - Need to either: fix TTT to actually improve, or disable it and focus on base model
 
+## Session 10: Baseline Establishment + Experiment Runner (2026-03-30)
+
+### Experiment Runner (`run_experiment.py`)
+
+Created `run_experiment.py` — a wrapper that runs `train_gpt.py` with frequent val
+checkpoints and compares against a saved baseline. Supports early stopping if worse.
+
+**Usage:**
+```bash
+source .venv/bin/activate
+
+# Show saved baseline
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py --show-baseline
+
+# Run experiment (auto-compares to baseline, kills early if worse)
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "exp_name" --env "KEY1=val1,KEY2=val2"
+
+# Run without early stopping
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "exp_name" --env "KEY1=val1" --no-early-stop
+
+# Run a different train script
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "exp_name" --script ./path/to/other/train_gpt.py
+
+# Specify GPU count (auto-detected if omitted)
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "exp_name" --nproc 2
+```
+
+**Key flags:**
+- `--baseline` — run once to generate baseline.json
+- `--name` — experiment name
+- `--env` — comma-separated KEY=VAL pairs passed to train_gpt.py
+- `--script` — path to train_gpt.py (default: same dir as run_experiment.py)
+- `--nproc` — GPU count (auto-detected if omitted)
+- `--no-early-stop` — disable early stopping
+- `--show-baseline` — print saved baseline values
+
+**Early stopping:** kills training if val_bpb is worse than baseline by >0.002 at
+2 consecutive time checkpoints after the 2-minute mark.
+
+### Baseline (4x A100 80GB, no TTT, pre-quant)
+
+Saved in `baseline.json`. Generated with `VAL_LOSS_EVERY=25`, `TTT_ENABLED=0`.
+
+| Time | val_bpb | Step |
+|------|---------|------|
+| 30s  | 2.1149  | ~75  |
+| 1m   | 1.7672  | ~150 |
+| 2m   | 1.5372  | ~275 |
+| 3m   | 1.4503  | ~400 |
+| 4m   | 1.3981  | ~525 |
+| 5m   | 1.3581  | ~675 |
+| 6m   | 1.3349  | ~800 |
+| 7m   | 1.3166  | ~925 |
+| 8m   | 1.3010  | ~1050|
+| 9m   | 1.2913  | ~1125|
+| 10m  | **1.2827** | ~1241|
+
+Post-quant (int8+zlib) sliding eval: **1.3056** (no TTT)
+Model size: 15.7MB (fits in 16MB)
+
+### Competition Landscape Research (2026-03-30)
+
+**Valid SOTA** (merged/pending, score-first compliant):
+| val_bpb | PR | Key Techniques |
+|---------|-----|----------------|
+| 1.1154  | #609 | Flat 11L, XSA-all + Full GPTQ, NO TTT |
+| 1.1171  | #593 | Flat 11L, Parallel Muon + Full GPTQ, NO TTT |
+| 1.1194  | #549 | LeakyReLU + Legal TTT + Parallel Muon |
+
+Note: PR #573 (1.0523) is INVALID — uses oracle min() selection (violates Condition 4).
+
+**Key techniques from top submissions:**
+1. **Full GPTQ** (not GPTQ-lite) — gets 1.115-1.117 WITHOUT TTT, ~0.02 bpb better
+2. **XSA on ALL layers** (not just last 4) — helped PR #609
+3. **Legal chunk-based TTT** (PR #549): parallel scoring across ranks, cosine LR decay
+   across chunks, freeze first 2 blocks, SGD LR=0.002, 3 epochs per 32K chunk
+4. **Parameter Banking + Parallel Muon** — batched Newton-Schulz, ~83ms/step
+5. **Int6+LZMA compression** — smaller model, fits more params
+6. **SwiGLU is WORSE** — better per-step but 45% slower = fewer steps, net negative
+
+**Our TTT implementation vs PR #549:**
+- Ours: ALL ranks process ALL windows (no parallelism), fixed LR, no block freezing
+- Theirs: distribute scoring across ranks (4x faster), cosine LR decay, freeze first 2 blocks
+- This explains why our TTT is slow AND doesn't help much
+
 ## Next Steps / Ideas
-1. **Understand why TTT hurts** — score-first TTT (1.3156) worse than no-TTT (1.2244)
-2. **Improve base model** — architecture changes to lower pre-quant val_bpb
-3. **Check GitHub PRs** for winning strategies: https://github.com/openai/parameter-golf/pulls
-4. **Verify int8 fits on 8xH100** — if not, need int6 or mixed int6/int8
-5. **Full Hessian GPTQ** — PR #593 shows -0.022 bpb over GPTQ-lite
-6. **Wider model dim** — 576 or 640 instead of 512, fewer layers to compensate
-7. **MoE** — multiple competitors report improvements
+1. **Rewrite TTT** to match PR #549 chunk-based parallel approach (biggest single win)
+2. **Full GPTQ** instead of GPTQ-lite (free ~0.02 bpb improvement)
+3. **XSA on all layers** instead of just last 4
+4. **Parameter Banking** for faster Muon optimizer steps
+5. **Improve base model pre-quant quality** — architecture/training changes
+6. **Verify int8 fits on 8xH100** — if not, need int6 or mixed
+7. **Wider model dim** — 576 or 640 instead of 512
