@@ -168,6 +168,144 @@ All four conditions apply to BOTH tracks.
 | #576 | **1.1164** | cmcdnd | 33.6M params + int5 GPTQ + Score-First TTT |
 | #593 | **1.1171** | abaybektursun | Full Hessian GPTQ + LeakyReLU(0.5)^2 (no TTT) |
 
+# Experiment Runner Guide
+
+## Overview
+
+`run_experiment.py` is a wrapper around `train_gpt.py` that:
+- Runs training with frequent validation checkpoints (every ~12s)
+- Records `val_bpb` at wall-clock time boundaries (30s, 1m, 2m, ..., 10m)
+- Compares against a saved baseline and **kills training early** if the experiment is worse
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `run_experiment.py` | The runner script |
+| `baseline.json` | Saved baseline val_bpb at each time checkpoint (auto-generated) |
+| `experiment_results/` | Directory where experiment results are saved as JSON |
+| `train_gpt.py` | The actual training script (modified via env vars) |
+
+## Baseline
+
+The baseline is stored in `baseline.json` — a simple dict mapping seconds to `val_bpb`:
+
+```json
+{
+  "30": 2.1149,
+  "60": 1.7672,
+  "120": 1.5372,
+  "180": 1.4503,
+  "240": 1.3981,
+  "300": 1.3581,
+  "360": 1.3349,
+  "420": 1.3166,
+  "480": 1.301,
+  "540": 1.2913,
+  "600": 1.2827
+}
+```
+
+These are **pre-quant val_bpb** values measured on **4x A100 80GB** GPUs with the default `train_gpt.py` config (no TTT, EMA enabled, 11L dim=512).
+
+The baseline only needs to be generated once. If you change the base model architecture, re-run `--baseline` to update it.
+
+## Usage
+
+All commands should be run from the repo root (`/data/repos/parameter-golf-fork/`). Always activate the venv first:
+
+```bash
+source .venv/bin/activate
+```
+
+### 1. Show the saved baseline
+
+```bash
+python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py --show-baseline
+```
+
+### 2. Re-generate baseline (only if needed)
+
+```bash
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py --baseline
+```
+
+This runs a full 10-min training with `VAL_LOSS_EVERY=25` and saves checkpoints to `baseline.json`. Takes ~14 min (including torch.compile warmup + sliding window eval).
+
+### 3. Run an experiment (with early stopping)
+
+```bash
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "my_experiment_name" \
+  --env "KEY1=val1,KEY2=val2"
+```
+
+The `--env` flag passes extra environment variables to `train_gpt.py`. These override hyperparameters defined in the `Hyperparameters` class. Common ones:
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `NUM_LAYERS` | 11 | Number of transformer layers |
+| `MODEL_DIM` | 512 | Model dimension |
+| `NUM_HEADS` | 8 | Attention heads |
+| `NUM_KV_HEADS` | 4 | KV heads (GQA) |
+| `MLP_MULT` | 3.0 | MLP hidden multiplier |
+| `BIGRAM_VOCAB_SIZE` | 2048 | Bigram hash table size |
+| `EMA_DECAY` | 0.997 | EMA decay rate |
+| `WARMDOWN_ITERS` | 3500 | LR warmdown iterations |
+| `TTT_ENABLED` | 1 | Enable test-time training |
+| `TTT_LR` | 1.3 | TTT learning rate |
+| `TTT_MODE` | score_first | TTT mode |
+| `QUANT_BITS` | 8 | Quantization bits (6 or 8) |
+| `SEED` | 42 | Random seed |
+
+### 4. Run without early stopping
+
+```bash
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "my_experiment" \
+  --env "MODEL_DIM=576" \
+  --no-early-stop
+```
+
+### 5. Specify GPU count
+
+```bash
+with-proxy python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/run_experiment.py \
+  --name "my_experiment" \
+  --env "MODEL_DIM=576" \
+  --nproc 2
+```
+
+If `--nproc` is omitted, the script auto-detects available GPUs via `nvidia-smi`.
+
+## Early Stopping Behavior
+
+- At each time checkpoint (30s, 1m, 2m, ...), the script compares experiment `val_bpb` to baseline
+- If the experiment is **worse by more than 0.002** at **2 consecutive checkpoints** after the 2-minute mark, it kills the training process
+- This saves GPU time — no point running 10 minutes if the change is clearly worse by minute 3
+
+## Output
+
+During the run, you'll see real-time comparisons:
+
+```
+  [ 30s] val_bpb=2.0500  baseline=2.1149  diff=-0.0649 + BETTER
+  [  1m] val_bpb=1.7200  baseline=1.7672  diff=-0.0472 + BETTER
+  [  2m] val_bpb=1.5500  baseline=1.5372  diff=+0.0128 x WORSE
+  [  3m] val_bpb=1.4700  baseline=1.4503  diff=+0.0197 x WORSE
+
+  EARLY STOP: worse than baseline at 2 consecutive checkpoints. Killing training.
+```
+
+At the end, a summary table is printed and results are saved to `experiment_results/<name>_<timestamp>.json`.
+
+## Important Notes
+
+- The script sets `TTT_ENABLED=0` by default (training-only, no TTT eval). This is intentional — TTT eval takes 10+ additional minutes and we want fast iteration on training changes.
+- The baseline was generated on **4x A100 80GB**. If you switch to different hardware, re-run `--baseline`.
+- `val_bpb` during training is **pre-quantization**. The final post-quant number will be slightly worse (~+0.02 for int8).
+- All experiment env vars are passed through to `train_gpt.py` — any `os.environ.get()` in `Hyperparameters` can be overridden.
+
 ## Our Current Best Config (Exp 57: val_bpb=1.0312 on 4xA100)
 - 11 layers, dim=512, 8 heads, 4 KV heads (GQA), 3x MLP (**LeakyReLU(0.5)^2**)
 - BigramHash(2048, dim=128) + SmearGate
@@ -497,11 +635,41 @@ The warmup prevents divergence at high LRs that previously failed (LR=1.0 diverg
 - Online TTT will likely give less improvement than offline TTT (fewer total gradient steps)
 - On 8xH100 (~7000 steps): pre-quant ~1.16-1.18, int8 fits may be an issue
 
+## Session 9: Score-First TTT Optimization (Exp 105-113)
+
+### Context
+Switched to compliant score-first TTT with SwiGLU + Gated Attention architecture.
+Score-first TTT: score chunk → lock in BPB → train on scored chunk → next chunk.
+Using env vars: TTT_ENABLED=1 TTT_OPTIMIZER=sgd TTT_LR=X TTT_EPOCHS=Y TTT_CHUNK_TOKENS=Z
+
+### TTT LR Sweep
+| Exp | LR | Epochs | Chunk Size | val_bpb | Notes |
+|-----|-----|--------|------------|---------|-------|
+| 107 | 0.002 | 3 | 200K | 1.3178 | First good result |
+| 108 | 0.003 | 3 | 200K | 1.3229 | Overshoots |
+| 109 | 0.002 | 1 | 200K | 1.3225 | Too few epochs |
+| 110 | 0.002 | 3 | 100K | 1.3172 | Smaller chunks help |
+| 111 | 0.002 | 3 | 50K | 1.3165 | Trend continues |
+| 112 | 0.002 | 3 | 25K | 1.3156 | BEST TTT (eval 1422s/4xA100) |
+| 113 | 0.001 | 3 | 25K | ??? | Was running, result unknown |
+
+### Key Findings
+- LR=0.002 optimal for SGD with 3 epochs (0.003 overshoots, 0.001 may be too slow)
+- 3 epochs > 1 epoch at same LR
+- Smaller chunks consistently better: 200K→100K→50K→25K all improved
+- Eval time scales with chunk count: 620s→787s→980s→1422s on 4xA100
+- On 8xH100 (4x faster), 25K chunks → ~356s, still within 10-min budget
+
+### CRITICAL ISSUE
+- Score-first TTT val_bpb=1.3156 is WORSE than no-TTT baseline val_bpb=1.2244
+- The baseline without TTT gets 1.2244 — TTT is currently HURTING performance
+- Need to either: fix TTT to actually improve, or disable it and focus on base model
+
 ## Next Steps / Ideas
-1. **CRITICAL: Implement online/score-first TTT** — evaluate each chunk, then train on it
-   - Must fit within 10min eval budget on 8xH100
-   - Model: score window → accumulate BPB → train on scored window → next window
-2. **Verify int8 fits on 8xH100** — if not, need int6 or mixed int6/int8
-3. **Full Hessian GPTQ** — PR #593 shows -0.022 bpb over GPTQ-lite
-4. **Wider model dim** — 576 or 640 instead of 512, fewer layers to compensate
-5. **Improve pre-quant quality** — architecture changes, training improvements
+1. **Understand why TTT hurts** — score-first TTT (1.3156) worse than no-TTT (1.2244)
+2. **Improve base model** — architecture changes to lower pre-quant val_bpb
+3. **Check GitHub PRs** for winning strategies: https://github.com/openai/parameter-golf/pulls
+4. **Verify int8 fits on 8xH100** — if not, need int6 or mixed int6/int8
+5. **Full Hessian GPTQ** — PR #593 shows -0.022 bpb over GPTQ-lite
+6. **Wider model dim** — 576 or 640 instead of 512, fewer layers to compensate
+7. **MoE** — multiple competitors report improvements
