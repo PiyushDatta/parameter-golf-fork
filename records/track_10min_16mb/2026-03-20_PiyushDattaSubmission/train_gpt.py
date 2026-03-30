@@ -47,7 +47,7 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 42))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -70,7 +70,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "1")))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     moe_enabled = bool(int(os.environ.get("MOE_ENABLED", "0")))
     moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", 2))
     moe_layers = os.environ.get("MOE_LAYERS", "")  # comma-separated layer indices, empty = last half
@@ -98,6 +98,13 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
+    # EngramLite: multi-head n-gram hash embeddings (replaces BigramHash when enabled)
+    engram_enabled = bool(int(os.environ.get("ENGRAM_ENABLED", "1")))
+    engram_buckets = int(os.environ.get("ENGRAM_BUCKETS", 2048))
+    engram_heads = int(os.environ.get("ENGRAM_HEADS", 2))
+    engram_orders = int(os.environ.get("ENGRAM_ORDERS", 2))  # 1=bigram only, 2=bigram+trigram
+    engram_dim_per_head = int(os.environ.get("ENGRAM_DIM_PER_HEAD", 32))
+
     ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "1")))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
@@ -115,8 +122,12 @@ class Hyperparameters:
 
     eval_temperature = float(os.environ.get("EVAL_TEMPERATURE", 1.0))
     quant_bits = int(os.environ.get("QUANT_BITS", 8))  # 6 = int6 (clip_range=31), 8 = int8 (clip_range=127)
+    gptq_enabled = bool(int(os.environ.get("GPTQ_ENABLED", "1")))  # Full Hessian GPTQ quantization
+    gptq_calibration_batches = int(os.environ.get("GPTQ_CALIBRATION_BATCHES", 64))
+    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    gptq_damp_factor = float(os.environ.get("GPTQ_DAMP_FACTOR", 0.01))
 
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_mode = os.environ.get("TTT_MODE", "score_first")  # "score_first" (compliant), "full", "twophase", or "adam"
     ttt_lr = float(os.environ.get("TTT_LR", 1.3))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 120))
@@ -363,30 +374,98 @@ def _classify_param(name: str) -> str:
         return "attn"
     return "other"
 
-def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
-    t32 = t.float()
-    if t32.ndim == 2:
-        best_q, best_s, best_err = None, None, float('inf')
-        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-            if pct < 1.0:
-                row_clip = torch.quantile(t32.abs(), pct, dim=1)
-            else:
-                row_clip = t32.abs().amax(dim=1)
-            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
-            recon = q.float() * s.float()[:, None]
-            err = (t32 - recon).pow(2).mean().item()
-            if err < best_err:
-                best_q, best_s, best_err = q, s, err
-        return best_q, best_s
-    amax = t32.abs().max().item()
-    scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
-    return q, scale
+def _gptq_block_sweep(W: Tensor, Hinv: Tensor, sf: Tensor, qmin: int, qmax: int, block_size: int) -> Tensor:
+    """GPTQ block-column sweep with Cholesky error compensation."""
+    rows, cols = W.shape
+    Q = torch.zeros_like(W, dtype=torch.int8)
+    W_work = W.clone()
+    for i1 in range(0, cols, block_size):
+        i2 = min(i1 + block_size, cols)
+        count = i2 - i1
+        W1 = W_work[:, i1:i2].clone()
+        Q1 = torch.zeros(rows, count, dtype=torch.int8, device=W.device)
+        Err1 = torch.zeros(rows, count, device=W.device)
+        Hinv1 = Hinv[i1:i2, i1:i2]
+        for i in range(count):
+            w = W1[:, i]
+            d = Hinv1[i, i]
+            q = torch.clamp(torch.round(w / sf), qmin, qmax).to(torch.int8)
+            Q1[:, i] = q
+            err = (w - q.float() * sf) / d
+            W1[:, i:] -= err.unsqueeze(1) * Hinv1[i, i:].unsqueeze(0)
+            Err1[:, i] = err
+        Q[:, i1:i2] = Q1
+        if i2 < cols:
+            W_work[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+    return Q
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip_range: int = 31):
+def quantize_int6_per_row(t: Tensor, clip_range: int = 31, hessian: Tensor | None = None,
+                           block_size: int = 128, damp_factor: float = 0.01) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim != 2:
+        amax = t32.abs().max().item()
+        scale = torch.tensor(max(amax / clip_range, 1e-12), dtype=torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
+        return q, scale
+    # If hessian available, use Full GPTQ with Cholesky error compensation
+    if hessian is not None:
+        device = t32.device
+        H = hessian.float().to(device).clone()
+        rows, cols = t32.shape
+        diag = torch.diag(H)
+        dead = diag == 0
+        damp = damp_factor * (torch.mean(diag[~dead]) if not dead.all() else torch.tensor(1.0, device=device))
+        diag_idx = torch.arange(cols, device=device)
+        H[diag_idx, diag_idx] += damp
+        H[dead, dead] = damp
+        perm = torch.argsort(torch.diag(H), descending=True)
+        inv_perm = torch.argsort(perm)
+        W = t32[:, perm].clone()
+        W[:, dead[perm]] = 0
+        H = H[perm][:, perm]
+        try:
+            Hinv = torch.linalg.cholesky(H)
+            Hinv = torch.cholesky_inverse(Hinv)
+            Hinv = torch.linalg.cholesky(Hinv, upper=True)
+        except torch.linalg.LinAlgError:
+            pass  # Fall through to percentile search below
+        else:
+            # Multi-pass GPTQ: try 5 percentiles, pick best MSE
+            best_q, best_s, best_err = None, None, float('inf')
+            for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+                if pct < 1.0:
+                    row_clip = torch.quantile(t32.abs(), pct, dim=1)
+                else:
+                    row_clip = t32.abs().amax(dim=1)
+                s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+                sf = s.float()
+                Q = _gptq_block_sweep(W, Hinv, sf, -clip_range, clip_range, block_size)
+                recon = Q.float() * sf[:, None]
+                mse = (W - recon).pow(2).mean().item()
+                if mse < best_err:
+                    best_q, best_s, best_err = Q, s, mse
+            best_q = best_q[:, inv_perm]
+            return best_q, best_s
+    # Fallback: percentile search without Hessian
+    best_q, best_s, best_err = None, None, float('inf')
+    for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+        if pct < 1.0:
+            row_clip = torch.quantile(t32.abs(), pct, dim=1)
+        else:
+            row_clip = t32.abs().amax(dim=1)
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+        q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
+        recon = q.float() * s.float()[:, None]
+        err = (t32 - recon).pow(2).mean().item()
+        if err < best_err:
+            best_q, best_s, best_err = q, s, err
+    return best_q, best_s
+
+def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip_range: int = 31,
+                         hessians: dict[str, Tensor] | None = None, block_size: int = 128, damp_factor: float = 0.01):
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
+    gptq_count = 0
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         cat = _classify_param(name)
@@ -403,7 +482,10 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip
             meta[name] = "passthrough_fp16"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            q, s = quantize_int6_per_row(t, clip_range=clip_range)
+            h = hessians.get(name + ".weight", hessians.get(name)) if hessians else None
+            q, s = quantize_int6_per_row(t, clip_range=clip_range, hessian=h, block_size=block_size, damp_factor=damp_factor)
+            if h is not None:
+                gptq_count += 1
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
@@ -412,6 +494,8 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int8"}
+    if gptq_count > 0:
+        print(f"gptq: applied Full Hessian GPTQ to {gptq_count} tensors")
     return result, meta
 
 def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
@@ -432,6 +516,42 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
         else:
             out[name] = (q.float() * float(s.item())).to(orig_dtype)
     return out
+
+
+def collect_hessians(model, train_loader, args, device, grad_accum_steps, num_batches=256):
+    """Collect H = X^T X for each CastedLinear layer for Full GPTQ quantization."""
+    hessians = {}
+    hooks = []
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear):
+            param_name = name + ".weight"
+            cols = module.weight.shape[1]
+            hessians[param_name] = torch.zeros(cols, cols, dtype=torch.float32, device=device)
+            def make_hook(pname):
+                def hook_fn(mod, inp, out):
+                    x = inp[0].detach()
+                    if x.ndim == 3:
+                        x = x.reshape(-1, x.shape[-1])
+                    hessians[pname] += (x.T @ x).float()
+                return hook_fn
+            h = module.register_forward_hook(make_hook(param_name))
+            hooks.append(h)
+    model.eval()
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for _ in range(num_batches):
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            model(x, y)
+    for h in hooks:
+        h.remove()
+    ws = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    for name in hessians:
+        H = hessians[name]
+        if ws > 1:
+            dist.all_reduce(H, op=dist.ReduceOp.SUM)
+        H /= (num_batches * ws)
+        hessians[name] = H.cpu()
+    model.train()
+    return hessians
 
 
 # -----------------------------
@@ -689,7 +809,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
+        x = F.leaky_relu(self.fc(x), negative_slope=0.3)
         return self.proj(x.square())
 
 
@@ -722,8 +842,8 @@ class MoEMLP(nn.Module):
         self._aux_loss = 2.0 * (frac_0 * avg_prob[0] + frac_1 * avg_prob[1])
 
         # Compute both experts (no branching)
-        h1 = self.proj1(F.leaky_relu(self.fc1(x), negative_slope=0.5).square())
-        h2 = self.proj2(F.leaky_relu(self.fc2(x), negative_slope=0.5).square())
+        h1 = self.proj1(F.leaky_relu(self.fc1(x), negative_slope=0.3).square())
+        h2 = self.proj2(F.leaky_relu(self.fc2(x), negative_slope=0.3).square())
 
         # Select via mask (top-1 hard routing with STE)
         mask = (top_idx == 0).unsqueeze(-1).to(x.dtype)  # [B, T, 1]
@@ -769,6 +889,43 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
+
+
+class EngramLite(nn.Module):
+    """Multi-head hash-based n-gram embedding with learned gating.
+    Replaces BigramHashEmbedding with: multi-head hashing for collision resistance,
+    bigram+trigram coverage, and a per-dim learned gate."""
+    def __init__(self, num_buckets: int, num_heads: int, num_orders: int, dim_per_head: int, model_dim: int):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.num_heads = num_heads
+        self.num_orders = num_orders
+        total_slots = num_orders * num_heads * num_buckets
+        concat_dim = num_orders * num_heads * dim_per_head
+        self.embed = nn.Embedding(total_slots, dim_per_head)
+        nn.init.normal_(self.embed.weight, std=0.01)
+        self.proj = CastedLinear(concat_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        self.scale = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        B = self.num_buckets
+        prev_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        bi_h0 = (prev_ids * 1009 + input_ids) % B
+        bi_h1 = ((prev_ids * 2719 + 314159) ^ (input_ids * 3137)) % B
+        indices = [bi_h0, bi_h1 + B]
+        if self.num_orders >= 2:
+            pp_ids = F.pad(prev_ids[:, :-1], (1, 0), value=0)
+            tri_h0 = ((pp_ids * 36313) ^ (prev_ids * 27191) ^ (input_ids * 4903)) % B
+            tri_h1 = ((pp_ids * 7919) ^ (prev_ids * 4391) ^ (input_ids * 6151)) % B
+            offset = 2 * B
+            indices.extend([tri_h0 + offset, tri_h1 + offset + B])
+        all_idx = torch.stack(indices, dim=-1)
+        all_emb = self.embed(all_idx)
+        flat = all_emb.reshape(*input_ids.shape, -1)
+        out = self.proj(flat)
+        gate = torch.sigmoid(self.scale.to(dtype=out.dtype))[None, None, :]
+        return out * gate
 
 
 class ValueEmbedding(nn.Module):
@@ -849,6 +1006,11 @@ class GPT(nn.Module):
         moe_enabled: bool = False,
         moe_num_experts: int = 2,
         moe_layers: str = "",
+        engram_enabled: bool = False,
+        engram_buckets: int = 8192,
+        engram_heads: int = 2,
+        engram_orders: int = 2,
+        engram_dim_per_head: int = 32,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -857,7 +1019,12 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        if engram_enabled:
+            self.bigram = EngramLite(engram_buckets, engram_heads, engram_orders, engram_dim_per_head, model_dim)
+        elif bigram_vocab_size > 0:
+            self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim)
+        else:
+            self.bigram = None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -1543,6 +1710,11 @@ def main() -> None:
         moe_enabled=args.moe_enabled,
         moe_num_experts=args.moe_num_experts,
         moe_layers=args.moe_layers,
+        engram_enabled=args.engram_enabled,
+        engram_buckets=args.engram_buckets,
+        engram_heads=args.engram_heads,
+        engram_orders=args.engram_orders,
+        engram_dim_per_head=args.engram_dim_per_head,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1838,10 +2010,22 @@ def main() -> None:
                     mask = param.abs() < threshold
                     param.masked_fill_(mask, 0.0)
 
+    # Collect Hessians for Full GPTQ (runs calibration batches through the model)
+    hessians = None
+    if args.gptq_enabled:
+        log0(f"gptq:collecting Hessians with {args.gptq_calibration_batches} calibration batches...")
+        t_hess = time.perf_counter()
+        calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        hessians = collect_hessians(base_model, calib_loader, args, device, grad_accum_steps,
+                                     num_batches=args.gptq_calibration_batches)
+        log0(f"gptq:Hessian collection done in {time.perf_counter() - t_hess:.1f}s, {len(hessians)} layers")
+
     # INT6 mixed quantization + zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     quant_clip_range = {6: 31, 8: 127}[args.quant_bits]
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"}, clip_range=quant_clip_range)
+    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"}, clip_range=quant_clip_range,
+                                                    hessians=hessians, block_size=args.gptq_block_size,
+                                                    damp_factor=args.gptq_damp_factor)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
