@@ -1,0 +1,11 @@
+{
+  "name": "exp155_10L_dim576",
+  "env": {
+    "NUM_LAYERS": "10",
+    "MODEL_DIM": "576",
+    "GATED_ATTENTION": "0"
+  },
+  "checkpoints": {},
+  "final_bpb": null,
+  "timestamp": "2026-04-03 14:34:00"
+}

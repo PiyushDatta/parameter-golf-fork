@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -71,7 +72,7 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "1")))
-    gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "1")))
+    gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))  # exp130+: GATED_ATTENTION=0 is optimal
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))
     moe_enabled = bool(int(os.environ.get("MOE_ENABLED", "0")))
     moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", 2))
@@ -84,10 +85,10 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))  # exp158: 0.95 beats 0.99 on 4xA100 (1.2272 vs 1.2276)
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 4))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))  # exp158: 0.85→0.95
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))  # exp158: 500 steps warmup
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     embed_beta1 = float(os.environ.get("EMBED_BETA1", 0.7))  # lower momentum for embeddings
@@ -96,7 +97,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.04))
 
-    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 16))  # stride=16 for competition (8xH100 has eval time budget); use 64 for local testing
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
@@ -115,9 +116,10 @@ class Hyperparameters:
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.7))  # start SWA when scale < 0.7 (covers ~last 100 steps)
     swa_every = int(os.environ.get("SWA_EVERY", 5))
+    swa_over_ema = False  # DEAD END (exp168: 1.3450) — EMA contaminates SWA checkpoints
 
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.40))  # even earlier QAT for more steps
+    qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.50))  # 50% proven better than 40% (exp130 vs exp132)
     prune_frac = float(os.environ.get("PRUNE_FRAC", 0.03))
 
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
@@ -131,6 +133,7 @@ class Hyperparameters:
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     gptq_damp_factor = float(os.environ.get("GPTQ_DAMP_FACTOR", 0.01))
     mixed_precision = bool(int(os.environ.get("MIXED_PRECISION", "0")))  # int5/6/7 per-group based on Hessian
+    optrot_enabled = bool(int(os.environ.get("OPTROT_ENABLED", "0")))  # Hadamard rotation before GPTQ
 
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_mode = os.environ.get("TTT_MODE", "score_first")  # "score_first" (compliant), "full", "twophase", or "adam"
@@ -412,6 +415,49 @@ def _byte_unshuffle(data: bytes) -> bytes:
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
+# --- Hadamard / OptRot rotation for quantization ---
+def _fast_walsh_hadamard(x: Tensor) -> Tensor:
+    """In-place Fast Walsh-Hadamard Transform along last dim. Requires power-of-2 dim."""
+    n = x.shape[-1]
+    h = 1
+    while h < n:
+        # Split into pairs of blocks of size h
+        x_view = x.view(*x.shape[:-1], n // (2 * h), 2, h)
+        a = x_view[..., 0, :].clone()
+        b = x_view[..., 1, :].clone()
+        x_view[..., 0, :] = a + b
+        x_view[..., 1, :] = a - b
+        h *= 2
+    return x / math.sqrt(n)
+
+def apply_optrot(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Hadamard rotation before quantization — distributes outliers."""
+    rotated = {}
+    for name, tensor in state_dict.items():
+        if tensor.ndim == 2 and tensor.shape[1] >= 64:
+            dim = tensor.shape[1]
+            if dim & (dim - 1) == 0:  # power of 2
+                rotated[name] = _fast_walsh_hadamard(tensor.float().clone()).to(tensor.dtype)
+            else:
+                rotated[name] = tensor
+        else:
+            rotated[name] = tensor
+    return rotated
+
+def reverse_optrot(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Reverse Hadamard rotation after dequantization. H is self-inverse (orthogonal, symmetric)."""
+    out = {}
+    for name, tensor in state_dict.items():
+        if tensor.ndim == 2 and tensor.shape[1] >= 64:
+            dim = tensor.shape[1]
+            if dim & (dim - 1) == 0:
+                out[name] = _fast_walsh_hadamard(tensor.float().clone()).to(tensor.dtype)
+            else:
+                out[name] = tensor
+        else:
+            out[name] = tensor
+    return out
+
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
@@ -528,8 +574,8 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31, hessian: Tensor | Non
             best_q, best_s, best_err = q, s, err
     return best_q, best_s
 
-_MP_BYTES_PER_PARAM_INT5 = 0.46
-_MP_COST_PER_EXTRA_BIT = 0.24
+_MP_BYTES_PER_PARAM_INT5 = 0.44  # calibrated: int6 actual=0.53, scaled by 5/6
+_MP_COST_PER_EXTRA_BIT = 0.09   # calibrated: 0.53/6 per param per bit
 _MP_NON_WEIGHT_COMPRESS = 0.55
 
 def _allocate_bits_mixed(hessians, state_dict, target_bytes=16_000_000, code_bytes=0):
@@ -539,6 +585,7 @@ def _allocate_bits_mixed(hessians, state_dict, target_bytes=16_000_000, code_byt
     tensor_to_group = {}
     for name, H in hessians.items():
         trace_val = float(torch.trace(H).item()) / H.shape[0]
+        # name may be "blocks.0.attn.qkv.weight" or "blocks.0.attn.qkv"
         pname = name.replace(".weight", "")
         if not pname.startswith("blocks."):
             continue
@@ -548,45 +595,52 @@ def _allocate_bits_mixed(hessians, state_dict, target_bytes=16_000_000, code_byt
         gkey = f"layer.{layer_idx}.{gtype}"
         group_traces.setdefault(gkey, []).append(trace_val)
         tensor_to_group[pname] = gkey
+        # Try both stripped and original name to find weight in state_dict
         w = state_dict.get(pname)
+        if w is None:
+            w = state_dict.get(pname + ".weight")
+        if w is None:
+            w = state_dict.get(name)
         if w is not None:
             group_numel[gkey] = group_numel.get(gkey, 0) + w.numel()
     group_sensitivity = {k: sum(v) / len(v) for k, v in group_traces.items()}
     ranked = sorted(group_sensitivity.items(), key=lambda x: x[1], reverse=True)
 
     total_quant_numel = sum(group_numel.values())
+    # Build set of all state_dict keys that are quantized (mapped to a group)
+    quantized_keys = set()
+    for tn in tensor_to_group:
+        quantized_keys.add(tn)
+        quantized_keys.add(tn + ".weight")
     non_weight_raw = sum(
         t.numel() * t.element_size() for name, t in state_dict.items()
-        if name not in {tn for tn in tensor_to_group}
+        if name not in quantized_keys and name.replace(".weight", "") not in tensor_to_group
     )
     base_estimate = code_bytes + int(non_weight_raw * _MP_NON_WEIGHT_COMPRESS) + int(total_quant_numel * _MP_BYTES_PER_PARAM_INT5)
     budget = int(target_bytes * 0.98) - base_estimate  # 2% headroom
+    print(f"  mixed_precision budget: target={target_bytes} code={code_bytes} non_weight_raw={non_weight_raw} "
+          f"quant_numel={total_quant_numel} base_est={base_estimate} budget={budget} groups={len(ranked)}")
 
     group_bits = {gkey: 5 for gkey, _ in ranked}
     estimated_extra = 0
     if budget > 0:
-        # Pass 1: try int7 for top group
-        if ranked:
-            top_gkey = ranked[0][0]
-            top_numel = group_numel.get(top_gkey, 0)
-            cost_int7 = int(top_numel * _MP_COST_PER_EXTRA_BIT * 2)
-            cost_int6 = int(top_numel * _MP_COST_PER_EXTRA_BIT)
-            if top_numel > 0 and cost_int7 <= budget:
-                group_bits[top_gkey] = 7
-                estimated_extra += cost_int7
-            elif top_numel > 0 and cost_int6 <= budget:
-                group_bits[top_gkey] = 6
-                estimated_extra += cost_int6
-        # Pass 2: promote remaining to int6
+        # Pass 1: promote groups to int6 starting from MOST sensitive (descending)
         for gkey, _ in ranked:
-            if group_bits[gkey] > 5:
-                continue
             numel = group_numel.get(gkey, 0)
             if numel == 0:
                 continue
             cost = int(numel * _MP_COST_PER_EXTRA_BIT)
             if estimated_extra + cost <= budget:
                 group_bits[gkey] = 6
+                estimated_extra += cost
+        # Pass 2: promote most sensitive int6 groups to int7
+        for gkey, _ in ranked:
+            numel = group_numel.get(gkey, 0)
+            if numel == 0 or group_bits[gkey] < 6:
+                continue
+            cost = int(numel * _MP_COST_PER_EXTRA_BIT)  # extra cost from int6->int7
+            if estimated_extra + cost <= budget:
+                group_bits[gkey] = 7
                 estimated_extra += cost
 
     bit_allocation = {}
@@ -616,8 +670,14 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], clip
             meta[name] = "passthrough_fp16"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            bits = bit_allocation.get(name, 6) if bit_allocation else 6
-            cr = {5: 15, 6: 31, 7: 63, 8: 127}.get(bits, clip_range)
+            if bit_allocation:
+                bits = bit_allocation.get(name)
+                if bits is None:
+                    bits = bit_allocation.get(name.replace(".weight", ""), 6)
+                cr = {5: 15, 6: 31, 7: 63, 8: 127}.get(bits, clip_range)
+            else:
+                bits = {15: 5, 31: 6, 63: 7, 127: 8}.get(clip_range, 6)
+                cr = clip_range
             h = hessians.get(name + ".weight", hessians.get(name)) if hessians else None
             q, s = quantize_int6_per_row(t, clip_range=cr, hessian=h, block_size=block_size, damp_factor=damp_factor)
             if h is not None:
@@ -1802,7 +1862,7 @@ def main() -> None:
         if not master_process:
             return
         if console:
-            print(msg)
+            print(msg, flush=True)
         if logfile is not None:
             with open(logfile, "a", encoding="utf-8") as f:
                 print(msg, file=f)
@@ -1923,7 +1983,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
-        weight_decay=0.04,
+        weight_decay=args.weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -2118,12 +2178,14 @@ def main() -> None:
 
         # SWA: collect checkpoints during warmdown (runs alongside EMA)
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            # Use EMA state instead of raw model if swa_over_ema is enabled
+            src_state = ema_state if (args.swa_over_ema and args.ema_enabled and ema_state is not None) else base_model.state_dict()
             if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                swa_state = {name: t.detach().cpu().clone() for name, t in src_state.items()}
                 swa_count = 1
-                log0(f"swa:start step:{step}")
+                log0(f"swa:start step:{step} source:{'ema' if args.swa_over_ema and ema_state is not None else 'model'}")
             else:
-                for name, t in base_model.state_dict().items():
+                for name, t in src_state.items():
                     swa_state[name] += t.detach().cpu()
                 swa_count += 1
 
@@ -2195,6 +2257,9 @@ def main() -> None:
 
     # INT6 mixed quantization + zlib export
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+    if args.optrot_enabled:
+        log0("optrot: applying Hadamard rotation before quantization...")
+        sd_cpu = apply_optrot(sd_cpu)
     quant_clip_range = {6: 31, 8: 127}[args.quant_bits]
     bit_alloc = None
     if args.mixed_precision and hessians:
@@ -2209,22 +2274,26 @@ def main() -> None:
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_raw_shuffled = _byte_shuffle(quant_raw, stride=2)
-    quant_blob = zlib.compress(quant_raw_shuffled, 9)
+    quant_blob = lzma.compress(quant_raw_shuffled, preset=9 | lzma.PRESET_EXTREME)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int8+zlib: {quant_file_bytes} bytes (payload:{len(quant_raw)} raw_torch:{len(quant_raw)} payload_ratio:{len(quant_raw)/quant_file_bytes:.2f}x)")
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model int6+lzma: {quant_file_bytes} bytes (payload:{len(quant_raw)} raw_torch:{len(quant_raw)} payload_ratio:{len(quant_raw)/quant_file_bytes:.2f}x)")
+        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
+        sys.stdout.flush()
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    decompressed = _byte_unshuffle(zlib.decompress(quant_blob_disk))
+    decompressed = _byte_unshuffle(lzma.decompress(quant_blob_disk))
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+    if args.optrot_enabled:
+        log0("optrot: reversing Hadamard rotation after dequantization...")
+        deq_state = reverse_optrot(deq_state)
     # Log quantization MSE
     orig_sd = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     total_mse, total_numel = 0.0, 0
@@ -2235,6 +2304,7 @@ def main() -> None:
             total_numel += diff.numel()
     if total_numel > 0:
         log0(f"quant_mse: {total_mse / total_numel:.8f} (over {total_numel} elements)")
+        sys.stdout.flush()
     base_model.load_state_dict(deq_state, strict=True)
 
     # TTT + Final Evaluation
@@ -2279,10 +2349,20 @@ def main() -> None:
             )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_quant_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_quant_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Write results to file so they're never lost to tee buffering
+    if master_process:
+        import json as _json
+        results = {"val_loss": float(q_val_loss), "val_bpb": float(q_val_bpb),
+                   "run_id": os.environ.get("RUN_ID", "unknown"),
+                   "steps": step, "quant_bits": args.quant_bits}
+        with open("last_result.json", "w") as _f:
+            _json.dump(results, _f, indent=2)
 
     if distributed:
         dist.destroy_process_group()

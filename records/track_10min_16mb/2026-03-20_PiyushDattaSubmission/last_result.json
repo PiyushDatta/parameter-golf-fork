@@ -1,0 +1,7 @@
+{
+  "val_loss": 2.074552951840191,
+  "val_bpb": 1.2286703639897507,
+  "run_id": "exp170_rope_base_50k",
+  "steps": 1216,
+  "quant_bits": 6
+}

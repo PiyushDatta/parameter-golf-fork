@@ -1,0 +1,25 @@
+{
+  "name": "exp161_qkgain1.5_mom095",
+  "env": {
+    "MUON_MOMENTUM": "0.95",
+    "MUON_MOMENTUM_WARMUP_START": "0.85",
+    "MUON_MOMENTUM_WARMUP_STEPS": "500",
+    "QK_GAIN_INIT": "1.5",
+    "GATED_ATTENTION": "0"
+  },
+  "checkpoints": {
+    "30": 1.9904,
+    "60": 1.7026,
+    "120": 1.507,
+    "180": 1.4304,
+    "240": 1.3858,
+    "300": 1.3549,
+    "360": 1.3458,
+    "420": 1.3159,
+    "480": 1.2962,
+    "540": 1.2758,
+    "600": 1.2503
+  },
+  "final_bpb": 1.2503,
+  "timestamp": "2026-04-03 20:21:47"
+}
