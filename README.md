@@ -38,6 +38,10 @@ VOCAB_SIZE=1024 \
 torchrun --standalone --nproc_per_node=1 ./records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
 ```
 3. [Optional] Might have to do this `chmod +x .venv/lib/python3.12/site-packages/triton/backends/nvidia/bin/ptxas`
+4. Profiling
+```
+torchrun --standalone --nproc_per_node=4 records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/profiler_do_not_touch.py records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt_do_not_touch.py
+```
 
 ## Leaderboard
 
@@ -94,7 +98,7 @@ We'd love to see weird & creative ideas in the challenge, since you never know w
 - [ ] H-net tokenization
 - [ ] Universal transformer - [We have lots of depth recurrence submissions, but I'd love to see one 4 hour
 - [ ] Megakernels
-- [ ] State-space models, E2E TTT, super long context for evaluation or training 
+- [ ] State-space models, E2E TTT, super long context for evaluation or training
 - [ ] Learning adapters on random linear maps
 
 ## Getting Started
