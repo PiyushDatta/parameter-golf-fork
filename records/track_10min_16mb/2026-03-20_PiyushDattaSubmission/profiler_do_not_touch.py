@@ -21,7 +21,7 @@ Environment variables:
     PROFILE_SKIP_STEPS=25       Steps to skip before profiling (warmup + compilation)
     PROFILE_ACTIVE_STEPS=5      Steps to actively profile
     PROFILE_GRAD_ACCUM=N        Backward calls per step (default: 8 // WORLD_SIZE)
-    PROFILE_OUTPUT_DIR=./prof   Output directory for traces and snapshots
+    PROFILE_OUTPUT_DIR=./logs/profiling_outputs   Output directory for traces and snapshots
     PROFILE_MEMORY=1            Record memory allocations (for pytorch.org/memory_viz)
     PROFILE_STACKS=0            Capture Python call stacks (slower, more detail)
     MAX_WALLCLOCK_SECONDS=120   Override training time (set automatically if unset)
@@ -57,7 +57,7 @@ IS_MASTER = RANK == 0
 SKIP = int(os.environ.get("PROFILE_SKIP_STEPS", 25))
 ACTIVE = int(os.environ.get("PROFILE_ACTIVE_STEPS", 5))
 GRAD_ACCUM = int(os.environ.get("PROFILE_GRAD_ACCUM", 8 // max(WORLD, 1)))
-OUTDIR = os.environ.get("PROFILE_OUTPUT_DIR", "./profile_output")
+OUTDIR = os.environ.get("PROFILE_OUTPUT_DIR", "./logs/profiling_outputs")
 MEMORY = bool(int(os.environ.get("PROFILE_MEMORY", "1")))
 STACKS = bool(int(os.environ.get("PROFILE_STACKS", "0")))
 
