@@ -465,25 +465,26 @@ def main() -> None:
         if IS_MASTER:
             dp = deferred_prof.get("ref")
             if dp is not None:
-                # Chrome trace (for manual inspection)
+                # export_chrome_trace can only be called ONCE per profiler instance.
+                # Save to TensorBoard dir (named *.pt.trace.json for torch-tb-profiler),
+                # then copy to trace.json for manual inspection.
+                import shutil
+                tb_dir = os.path.join(OUTDIR, "tensorboard")
+                os.makedirs(tb_dir, exist_ok=True)
+                tb_trace = os.path.join(tb_dir, f"worker{RANK}.pt.trace.json")
+                trace_path = os.path.join(OUTDIR, "trace.json")
                 try:
-                    trace_path = os.path.join(OUTDIR, "trace.json")
-                    dp.export_chrome_trace(trace_path)
+                    dp.export_chrome_trace(tb_trace)
+                    shutil.copy2(tb_trace, trace_path)
                     print(f"\n[profiler] Chrome trace saved: {trace_path}")
+                    print(f"[profiler] TensorBoard trace saved: {tb_dir}/")
+                    print(f"[profiler]")
+                    print(f"[profiler] To visualize locally:")
+                    print(f"[profiler]   1. Remote:  tensorboard --logdir={tb_dir} --port=6006 --bind_all")
+                    print(f"[profiler]   2. Local:   ssh -L 6006:localhost:6006 <remote-host>")
+                    print(f"[profiler]   3. Browser: http://localhost:6006/#pytorch_profiler")
                 except Exception as e:
                     print(f"[profiler] Trace export failed: {e}")
-                # TensorBoard trace (for tensorboard --logdir)
-                try:
-                    tb_dir = os.path.join(OUTDIR, "tensorboard")
-                    os.makedirs(tb_dir, exist_ok=True)
-                    tb_trace = os.path.join(tb_dir, f"worker{RANK}.pt.trace.json")
-                    dp.export_chrome_trace(tb_trace)
-                    print(f"[profiler] TensorBoard trace saved: {tb_dir}/")
-                    print(f"[profiler] Run: tensorboard --logdir={tb_dir} --port=6006")
-                    print(f"[profiler] Then SSH tunnel: ssh -L 6006:localhost:6006 <remote>")
-                    print(f"[profiler] Open http://localhost:6006/#pytorch_profiler")
-                except Exception as e:
-                    print(f"[profiler] TensorBoard export failed: {e}")
                 try:
                     _report(dp)
                 except Exception as e:
@@ -515,23 +516,27 @@ def main() -> None:
                 pass
 
         if IS_MASTER:
+            tb_dir = os.path.join(OUTDIR, "tensorboard")
             print(f"\n{'=' * 100}")
             print("HOW TO USE THE OUTPUT")
             print("=" * 100)
-            print(f"  1. Chrome trace:    {OUTDIR}/trace.json")
+            print(f"  1. TensorBoard (recommended — interactive UI with all views):")
+            print(f"     Remote:  tensorboard --logdir={tb_dir} --port=6006 --bind_all")
+            print(f"     Local:   ssh -L 6006:localhost:6006 <remote-host>")
+            print(f"     Browser: http://localhost:6006/#pytorch_profiler")
+            print(f"     -> Overview, Operator, Trace, Memory views all in one place")
+            print(f"  2. Chrome trace (manual): {OUTDIR}/trace.json")
             print(f"     -> Open in chrome://tracing  OR  https://ui.perfetto.dev")
             print(f"     -> Zoom into a training step to see GPU kernel timeline")
-            print(f"     -> Look for gaps between kernels (= CPU overhead or sync stalls)")
             if MEMORY:
-                print(f"  2. Memory snapshot: {OUTDIR}/memory_snapshot.pickle")
+                print(f"  3. Memory snapshot: {OUTDIR}/memory_snapshot.pickle")
                 print(f"     -> Upload to https://pytorch.org/memory_viz")
                 print(f"     -> Shows allocation timeline, peak crossovers, tensor lifetimes")
-                print(f"     -> Look for memory spikes during backward pass (activation memory)")
-            print(f"  3. What to look for:")
+            print(f"  4. What to look for:")
             print(f"     -> High 'other' % in category breakdown = wasted time in small ops")
             print(f"     -> MFU < 30% on A100 = memory-bandwidth bound, need larger matmuls")
             print(f"     -> Big gap between CPU and GPU time = CPU bottleneck (data loading, Python)")
-            print(f"  4. Do NOT wrap with nsys — it blocks CUPTI and you lose GPU kernel times")
+            print(f"  5. Do NOT wrap with nsys — it blocks CUPTI and you lose GPU kernel times")
 
         # Final cleanup (GPU memory, dist, child processes)
         _cleanup("finally")
