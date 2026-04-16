@@ -42,6 +42,15 @@ torchrun --standalone --nproc_per_node=1 ./records/track_10min_16mb/2026-03-20_P
 ```
 torchrun --standalone --nproc_per_node=4 records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/profiler_do_not_touch.py records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt_do_not_touch.py
 ```
+4.1 Tensorboard
+```
+tensorboard --logdir=./logs/profiling_outputs/tensorboard --port=6006 --bind_all
+```
+Might need ssh tunnel:
+```
+ssh -L 6006:localhost:6006 $HOSTNAME
+```
+Open http://localhost:6006/#pytorch_profiler in your browser.
 
 ## Leaderboard
 
