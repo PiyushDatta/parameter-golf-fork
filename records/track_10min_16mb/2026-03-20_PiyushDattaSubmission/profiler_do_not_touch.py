@@ -465,12 +465,25 @@ def main() -> None:
         if IS_MASTER:
             dp = deferred_prof.get("ref")
             if dp is not None:
+                # Chrome trace (for manual inspection)
                 try:
                     trace_path = os.path.join(OUTDIR, "trace.json")
                     dp.export_chrome_trace(trace_path)
                     print(f"\n[profiler] Chrome trace saved: {trace_path}")
                 except Exception as e:
                     print(f"[profiler] Trace export failed: {e}")
+                # TensorBoard trace (for tensorboard --logdir)
+                try:
+                    tb_dir = os.path.join(OUTDIR, "tensorboard")
+                    os.makedirs(tb_dir, exist_ok=True)
+                    tb_trace = os.path.join(tb_dir, f"worker{RANK}.pt.trace.json")
+                    dp.export_chrome_trace(tb_trace)
+                    print(f"[profiler] TensorBoard trace saved: {tb_dir}/")
+                    print(f"[profiler] Run: tensorboard --logdir={tb_dir} --port=6006")
+                    print(f"[profiler] Then SSH tunnel: ssh -L 6006:localhost:6006 <remote>")
+                    print(f"[profiler] Open http://localhost:6006/#pytorch_profiler")
+                except Exception as e:
+                    print(f"[profiler] TensorBoard export failed: {e}")
                 try:
                     _report(dp)
                 except Exception as e:
