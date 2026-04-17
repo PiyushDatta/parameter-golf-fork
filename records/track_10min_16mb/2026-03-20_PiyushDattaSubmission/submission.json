@@ -1,11 +1,31 @@
 {
-  "author": "Baseline",
-  "github_id": "openai",
-  "name": "Naive Baseline",
-  "blurb": "SP-1024 9x512 KV4 run on pgut1 using the published Hugging Face fineweb10B_sp1024 export and the current train_gpt.py; score is the default final int8+zlib roundtrip metric under the 16,000,000-byte cap.",
-  "date": "2026-03-18T14:56:29Z",
-  "val_loss": 2.07269931,
-  "val_bpb": 1.2243657,
-  "bytes_total": 15863489,
-  "bytes_code": 47642
+  "author": "Piyush Datta",
+  "github_id": "PiyushDatta",
+  "name": "SP8192 SOTA-Adapted with SWA + Half-Batch for Limited Hardware",
+  "blurb": "SOTA-adapted architecture (SP8192, MLP4x, MuonEq-R, SDClip GPTQ, parallel residuals) with SWA and half-batch (393K tokens/step for 2x more steps). Key findings: SWA >> EMA below ~1100 steps (0.045 bpb), half-batch gives -0.006 bpb via 2x more steps.",
+  "date": "2026-04-13",
+  "val_bpb": 1.1617,
+  "val_bpb_std": 0.0010,
+  "seeds": [42, 137, 7],
+  "seed_results": {
+    "42": {"sliding_bpb": 1.1608, "post_gptq": 1.1770, "size": 15997000},
+    "137": {"sliding_bpb": 1.1627, "post_gptq": 1.1789, "size": 15998000},
+    "7": {"sliding_bpb": 1.1616, "post_gptq": 1.1786, "size": 15997000}
+  },
+  "hardware": "4xA100 80GB",
+  "training_steps": 1912,
+  "ms_per_step": 307,
+  "bytes_total": 15997000,
+  "bytes_code": 15600,
+  "train_batch_tokens": 393216,
+  "techniques": [
+    "SP8192 tokenizer",
+    "MLP 4.0x with LZMA code compression",
+    "Half-batch (393K tokens/step for 2x more steps)",
+    "MuonEq-R (row-normalized Muon)",
+    "SDClip GPTQ (int6 matrix, int8 embed)",
+    "Parallel residuals (layer 7+)",
+    "SWA (131 warmdown checkpoints)",
+    "Brotli-11 compression with byte-shuffle"
+  ]
 }
