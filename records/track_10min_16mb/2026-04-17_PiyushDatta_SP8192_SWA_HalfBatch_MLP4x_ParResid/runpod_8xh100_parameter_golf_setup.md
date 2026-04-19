@@ -72,8 +72,8 @@ ls -lah data/tokenizers | grep 8192
 
 You should see files like:
 
--   `data/datasets/fineweb10B_sp1024/fineweb_train_000000.bin`
--   `data/tokenizers/fineweb_1024_bpe.model`
+-   `data/datasets/fineweb10B_sp8192/fineweb_train_000000.bin`
+-   `data/tokenizers/fineweb_8192_bpe.model`
 
 ---
 
@@ -103,15 +103,50 @@ DATA_DIR=./data  /workspace/uv-envs/parameter-golf/bin/python -m torch.distribut
   records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
 ```
 
+The training script writes its own run log under `./logs/` and prints the exact path near the top as:
+
+```text
+logfile: logs/<run_id>.txt
+```
+
+If you want the full console stream saved too, run through `tee`:
+
+```bash
+DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
+  --standalone --nproc_per_node=8 \
+  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py \
+  2>&1 | tee /dev/shm/pg-logs/train_console.log
+```
+
 ---
 
 ## 8) Save logs/results somewhere persistent
 
 Because `/dev/shm` is temporary, copy logs back out after the run.
 
+The safest pattern is:
+
+1. Copy the per-run script log from `./logs/<run_id>.txt`
+2. Optionally copy the `tee` console log if you used it
+3. If you want to keep the record folder up to date, copy the run log to `train.log`
+4. For seeded runs, also copy it to `train_seed<seed>.log`
+
 ```bash
 mkdir -p /workspace/pg-results
-cp /dev/shm/pg-logs/train_sp1024_8xh100.log /workspace/pg-results/
+
+# The script prints "logfile: logs/<run_id>.txt". Grab the latest one if needed.
+LATEST_LOG=$(ls -t /dev/shm/parameter-golf-fork/logs/*.txt | head -n 1)
+cp "$LATEST_LOG" /workspace/pg-results/
+
+# If you used tee for the console stream:
+cp /dev/shm/pg-logs/train_console.log /workspace/pg-results/ 2>/dev/null || true
+
+# Update the record directory log files if desired.
+cp "$LATEST_LOG" /dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train.log
+
+# Example for a seeded run:
+SEED=7
+cp "$LATEST_LOG" "/dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_seed${SEED}.log"
 ```
 
 If the run writes any result files or artifacts, copy those too.
