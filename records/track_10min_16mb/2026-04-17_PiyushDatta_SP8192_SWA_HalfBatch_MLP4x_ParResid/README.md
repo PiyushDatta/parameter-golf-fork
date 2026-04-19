@@ -1,4 +1,4 @@
-# Non-Record Submission: SP8192 SOTA-Adapted with SWA + Half-Batch for Limited Hardware
+# Record Submission: SP8192 SOTA-Adapted with SWA + Half-Batch for Limited Hardware
 
 **val_bpb = 1.1617** (3-seed mean, std 0.0010) | **~16.0 MB** | 4xA100 80GB
 
