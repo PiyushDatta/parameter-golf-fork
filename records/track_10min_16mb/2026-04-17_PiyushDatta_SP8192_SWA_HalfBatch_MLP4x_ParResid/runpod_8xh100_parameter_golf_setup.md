@@ -35,6 +35,7 @@ uv venv /workspace/uv-envs/parameter-golf
 source /workspace/uv-envs/parameter-golf/bin/activate
 cd /dev/shm/parameter-golf-fork
 uv sync --active
+uv sync --active --reinstall-package torch
 ```
 
 ## 4) Verify PyTorch if needed
@@ -60,13 +61,13 @@ mkdir -p /dev/shm/pg-logs
 
 ---
 
-## 6) Download the SP1024 dataset for the March 20 submission
+## 6) Download the dataset
 
 ```
 cd /dev/shm/parameter-golf-fork
-python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 10
-ls -lah data/datasets/fineweb10B_sp1024 | head
-ls -lah data/tokenizers
+MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 128
+ls -lah data/datasets/fineweb10B_sp8192 | head
+ls -lah data/tokenizers | grep 8192
 ```
 
 You should see files like:
@@ -80,19 +81,26 @@ You should see files like:
 
 Use the **venv Python** explicitly.
 
-```bash
+```
 cd /dev/shm/parameter-golf-fork
+
+mkdir -p /workspace/pg-tmp
+mkdir -p /workspace/torchinductor-cache
+mkdir -p /workspace/triton-cache
 
 export HF_HUB_DISABLE_XET=1
 export HF_HOME=/dev/shm/hf-cache
 export HUGGINGFACE_HUB_CACHE=/dev/shm/hf-cache/hub
 export HF_DATASETS_CACHE=/dev/shm/hf-cache/datasets
-export TMPDIR=/dev/shm
+export TMPDIR=/workspace/pg-tmp
+export TORCHINDUCTOR_CACHE_DIR=/workspace/torchinductor-cache
+export TRITON_CACHE_DIR=/workspace/triton-cache
 
-/workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
+rm -rf /dev/shm/torchinductor_root /dev/shm/triton
+
+DATA_DIR=./data  /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=8 \
-  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py \
-  2>&1 | tee /dev/shm/pg-logs/train_sp1024_8xh100.log
+  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
 ```
 
 ---
