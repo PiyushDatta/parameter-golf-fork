@@ -77,11 +77,11 @@ You should see files like:
 
 ---
 
-## 7) Launch training
+## 7) Generate 3-seed submission logs (RECOMMENDED)
 
-Use the **venv Python** explicitly.
+The easiest way to run training + collect all logs for submission:
 
-```
+```bash
 cd /dev/shm/parameter-golf-fork
 
 mkdir -p /workspace/pg-tmp
@@ -98,23 +98,56 @@ export TRITON_CACHE_DIR=/workspace/triton-cache
 
 rm -rf /dev/shm/torchinductor_root /dev/shm/triton
 
-DATA_DIR=./data  /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
+/workspace/uv-envs/parameter-golf/bin/python \
+  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/generate_submission_logs.py \
+  --nproc 8
+```
+
+This will:
+1. Run training with 3 seeds (42, 137, 7) sequentially
+2. Save per-seed logs to `records/.../logs/seed_42.log`, etc.
+3. Parse all results and write `records/.../logs/summary.json`
+4. Print a summary table with mean/std val_bpb and artifact sizes
+
+Each seed takes ~12-15 min (10 min training + GPTQ + eval). Total: ~40-45 min.
+
+**Dry run** (preview commands without running):
+
+```bash
+/workspace/uv-envs/parameter-golf/bin/python \
+  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/generate_submission_logs.py \
+  --nproc 8 --dry-run
+```
+
+**Single seed** (quick test before full 3-seed run):
+
+```bash
+/workspace/uv-envs/parameter-golf/bin/python \
+  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/generate_submission_logs.py \
+  --nproc 8 --seeds 42
+```
+
+---
+
+## 7b) Manual single run (alternative)
+
+If you prefer to run training manually:
+
+```bash
+cd /dev/shm/parameter-golf-fork
+
+# Set up env vars as in step 7 above, then:
+DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=8 \
-  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
+  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/train_gpt.py
 ```
 
-The training script writes its own run log under `./logs/` and prints the exact path near the top as:
-
-```text
-logfile: logs/<run_id>.txt
-```
-
-If you want the full console stream saved too, run through `tee`:
+To save the console stream:
 
 ```bash
 DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=8 \
-  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py \
+  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/train_gpt.py \
   2>&1 | tee /dev/shm/pg-logs/train_console.log
 ```
 
@@ -124,29 +157,22 @@ DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distribute
 
 Because `/dev/shm` is temporary, copy logs back out after the run.
 
-The safest pattern is:
+**If you used `generate_submission_logs.py`** (step 7), logs are already at:
+-   `records/.../logs/seed_42.log`, `seed_137.log`, `seed_7.log`
+-   `records/.../logs/summary.json` (parsed results with mean/std)
 
-1. Copy the per-run script log from `./logs/<run_id>.txt`
-2. Optionally copy the `tee` console log if you used it
-3. If you want to keep the record folder up to date, copy the run log to `train.log`
-4. For seeded runs, also copy it to `train_seed<seed>.log`
+Copy the whole submission directory to `/workspace`:
 
 ```bash
 mkdir -p /workspace/pg-results
-
-# The script prints "logfile: logs/<run_id>.txt". Grab the latest one if needed.
-LATEST_LOG=$(ls -t /dev/shm/parameter-golf-fork/logs/*.txt | head -n 1)
-cp "$LATEST_LOG" /workspace/pg-results/
-
-# If you used tee for the console stream:
-cp /dev/shm/pg-logs/train_console.log /workspace/pg-results/ 2>/dev/null || true
-
-# Update the record directory log files if desired.
-cp "$LATEST_LOG" /dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train.log
-
-# Example for a seeded run:
-SEED=7
-cp "$LATEST_LOG" "/dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_seed${SEED}.log"
+cp -r /dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid /workspace/pg-results/
 ```
 
-If the run writes any result files or artifacts, copy those too.
+**If you ran manually** (step 7b), grab the latest log:
+
+```bash
+mkdir -p /workspace/pg-results
+LATEST_LOG=$(ls -t /dev/shm/parameter-golf-fork/logs/*.txt | head -n 1)
+cp "$LATEST_LOG" /workspace/pg-results/
+cp /dev/shm/pg-logs/train_console.log /workspace/pg-results/ 2>/dev/null || true
+```
