@@ -47,6 +47,7 @@ import os
 import runpy
 import signal
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -375,7 +376,30 @@ def _run_tensorboard(tb_url: str, logdir: str) -> None:
     # Run TensorBoard on a local-only port, then SSL-wrap on the public port
     tb_internal_port = port + 1000
     tb_cmd = [tb_bin, "--logdir", logdir, "--port", str(tb_internal_port), "--host", "127.0.0.1"]
-    tb_proc = subprocess.Popen(tb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    tb_proc = subprocess.Popen(tb_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def _stream_tb_output():
+        for line in tb_proc.stdout:
+            print(f"[tensorboard] {line.decode(errors='replace').rstrip()}")
+    tb_thread = threading.Thread(target=_stream_tb_output, daemon=True)
+    tb_thread.start()
+
+    # Wait for TensorBoard to be ready
+    import urllib.request
+    for attempt in range(30):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{tb_internal_port}/", timeout=1)
+            print(f"[profiler] TensorBoard is ready (attempt {attempt+1})")
+            break
+        except Exception:
+            if tb_proc.poll() is not None:
+                print(f"[profiler] ERROR: TensorBoard exited with code {tb_proc.returncode}")
+                return
+            time.sleep(1)
+    else:
+        print(f"[profiler] ERROR: TensorBoard failed to start after 30s")
+        tb_proc.terminate()
+        return
 
     import http.server
     import ssl
