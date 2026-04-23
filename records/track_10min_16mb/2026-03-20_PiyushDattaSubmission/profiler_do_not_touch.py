@@ -506,17 +506,17 @@ def main() -> None:
         est_s = needed * 0.5  # ~500ms/step rough estimate
         print(f"[profiler] Need ~{needed} steps (~{est_s:.0f}s) to complete profiling")
 
-    # -- Patch backward() for step counting + NVTX markers --
+    # -- Patch backward/forward/optimizer for step counting + NVTX markers --
     state = {"bwd": 0, "steps": 0, "done": False}
     prof_ref: dict = {"prof": None}
     got_results = {"v": False}
 
+    # Patch backward
     _orig_backward = torch.Tensor.backward
 
     def _patched_backward(self, *args, **kwargs):
-        torch.cuda.nvtx.range_push("backward")
-        result = _orig_backward(self, *args, **kwargs)
-        torch.cuda.nvtx.range_pop()
+        with torch.profiler.record_function("backward"):
+            result = _orig_backward(self, *args, **kwargs)
 
         state["bwd"] += 1
         if state["bwd"] % GRAD_ACCUM == 0:
@@ -534,6 +534,33 @@ def main() -> None:
         return result
 
     torch.Tensor.backward = _patched_backward
+
+    # Patch nn.Module.__call__ with record_function (compile-safe, unlike NVTX)
+    _orig_module_call = torch.nn.Module.__call__
+
+    def _patched_module_call(self, *args, **kwargs):
+        with torch.profiler.record_function(f"fwd:{self.__class__.__name__}"):
+            return _orig_module_call(self, *args, **kwargs)
+
+    torch.nn.Module.__call__ = _patched_module_call
+
+    # Patch optimizer.step()
+    _orig_optim_step = torch.optim.Optimizer.step
+
+    def _patched_optim_step(self, *args, **kwargs):
+        with torch.profiler.record_function(f"optim:{self.__class__.__name__}"):
+            return _orig_optim_step(self, *args, **kwargs)
+
+    torch.optim.Optimizer.step = _patched_optim_step
+
+    # Patch optimizer.zero_grad()
+    _orig_optim_zero = torch.optim.Optimizer.zero_grad
+
+    def _patched_optim_zero(self, *args, **kwargs):
+        with torch.profiler.record_function("optim:zero_grad"):
+            return _orig_optim_zero(self, *args, **kwargs)
+
+    torch.optim.Optimizer.zero_grad = _patched_optim_zero
 
     # -- Memory history recording --
     if MEMORY:
@@ -565,6 +592,7 @@ def main() -> None:
         profile_memory=MEMORY,
         with_stack=STACKS,
         with_flops=True,
+        with_modules=True,
     )
     prof_ref["prof"] = prof
 
@@ -585,6 +613,9 @@ def main() -> None:
             pass
 
         torch.Tensor.backward = _orig_backward
+        torch.nn.Module.__call__ = _orig_module_call
+        torch.optim.Optimizer.step = _orig_optim_step
+        torch.optim.Optimizer.zero_grad = _orig_optim_zero
 
         # -- Deferred reporting (safe: training is done, no NCCL in flight) --
         if IS_MASTER:
