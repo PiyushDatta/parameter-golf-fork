@@ -84,6 +84,36 @@ DATA_DIR=./data/ SEED=42 torchrun --standalone --nproc_per_node=4 records/track_
 DATA_DIR=./data/ SEED=42 torchrun --standalone --nproc_per_node=8 records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
 ```
 
+## Profiling
+
+`profiler_do_not_touch.py` wraps any training script with PyTorch's built-in profiler (per-kernel GPU timing, FLOPS/MFU, memory tracking, Chrome trace).
+
+```bash
+# Profile a training run (auto-caps at 120s, profiles 5 steps after compile warmup)
+torchrun --standalone --nproc_per_node=4 \
+  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/profiler_do_not_touch.py \
+  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
+
+# Profile + auto-launch TensorBoard with SSL via a reverse proxy URL:
+torchrun --standalone --nproc_per_node=4 \
+  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/profiler_do_not_touch.py \
+  --load-tensorboard https://your-proxy-url.example.com \
+  records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/train_gpt.py
+
+# View existing profiling logs in TensorBoard (no re-profiling needed):
+python records/track_10min_16mb/2026-03-20_PiyushDattaSubmission/profiler_do_not_touch.py \
+  --load-tensorboard https://your-proxy-url.example.com
+```
+
+The `--load-tensorboard` flag starts TensorBoard bound to `[::]` with SSL (using host certs at `/etc/pki/tls/certs/`) and proxies to TensorBoard internally. The port is auto-extracted from the URL. Press Ctrl+C to stop.
+
+Output files are saved to `./logs/profiling_outputs/` by default (override with `PROFILE_OUTPUT_DIR`):
+- `trace.json` — open in `chrome://tracing` or `ui.perfetto.dev`
+- `memory_snapshot.pickle` — upload to `pytorch.org/memory_viz`
+- `tensorboard/` — TensorBoard event files
+
+See `profiler_do_not_touch.py --help` for all environment variables.
+
 ## Requirements
 
 See `requirements.txt`. Key additional package: `brotli`.
