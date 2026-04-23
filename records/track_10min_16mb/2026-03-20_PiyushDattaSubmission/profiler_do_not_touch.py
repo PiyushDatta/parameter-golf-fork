@@ -17,6 +17,14 @@ Usage:
     torchrun --standalone --nproc_per_node=4 \
         profiler_do_not_touch.py train_gpt_do_not_touch.py
 
+    # Profile then launch TensorBoard (stays running until you Ctrl+C):
+    torchrun --standalone --nproc_per_node=4 \
+        profiler_do_not_touch.py --load-tensorboard https://my-proxy-url.example.com \
+        train_gpt_do_not_touch.py
+
+    # Launch TensorBoard on existing logs (no profiling, no torchrun needed):
+    python profiler_do_not_touch.py --load-tensorboard https://my-proxy-url.example.com
+
 Environment variables:
     PROFILE_SKIP_STEPS=25       Steps to skip before profiling (warmup + compilation)
     PROFILE_ACTIVE_STEPS=5      Steps to actively profile
@@ -330,12 +338,129 @@ def _signal_handler(signum: int, frame) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def _run_tensorboard(tb_url: str, logdir: str) -> None:
+    """Launch TensorBoard with an SSL wrapper for reverse-proxy access."""
+    import re
+    import socket
+    import subprocess
+    import shutil
+    import threading
+
+    port = 6006
+    m = re.search(r"-(\d+)--", tb_url)
+    if m:
+        port = int(m.group(1))
+
+    tb_bin = shutil.which("tensorboard")
+    if tb_bin is None:
+        print("[profiler] Error: tensorboard not found on PATH. Install with: pip install tensorboard")
+        return
+
+    hostname = socket.gethostname()
+    cert = f"/etc/pki/tls/certs/{hostname}.crt"
+    key = f"/etc/pki/tls/certs/{hostname}.key"
+
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        # No SSL certs — just run plain HTTP
+        cmd = [tb_bin, "--logdir", logdir, "--port", str(port), "--host", "::"]
+        print(f"\n[profiler] Starting TensorBoard on port {port} (no SSL)...")
+        print(f"[profiler] Open in browser: {tb_url}")
+        print(f"[profiler] Press Ctrl+C to stop.\n")
+        try:
+            subprocess.run(cmd)
+        except KeyboardInterrupt:
+            print("\n[profiler] TensorBoard stopped.")
+        return
+
+    # Run TensorBoard on a local-only port, then SSL-wrap on the public port
+    tb_internal_port = port + 1000
+    tb_cmd = [tb_bin, "--logdir", logdir, "--port", str(tb_internal_port), "--host", "127.0.0.1"]
+    tb_proc = subprocess.Popen(tb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    import http.server
+    import ssl
+    import urllib.request
+
+    class ProxyHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self._proxy()
+        def do_POST(self):
+            self._proxy()
+        def _proxy(self):
+            try:
+                url = f"http://127.0.0.1:{tb_internal_port}{self.path}"
+                body = None
+                if 'Content-Length' in self.headers:
+                    body = self.rfile.read(int(self.headers['Content-Length']))
+                req = urllib.request.Request(url, data=body, method=self.command)
+                for h, v in self.headers.items():
+                    if h.lower() not in ('host', 'connection'):
+                        req.add_header(h, v)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    self.send_response(resp.status)
+                    for h, v in resp.getheaders():
+                        if h.lower() not in ('transfer-encoding', 'connection'):
+                            self.send_header(h, v)
+                    self.end_headers()
+                    self.wfile.write(resp.read())
+            except Exception as e:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(f"Proxy error: {e}".encode())
+        def log_message(self, format, *args):
+            pass  # suppress request logs
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+
+    class HTTPServerV6(http.server.HTTPServer):
+        address_family = socket.AF_INET6
+    server = HTTPServerV6(('::', port), ProxyHandler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+
+    print(f"\n[profiler] TensorBoard running (internal port {tb_internal_port}, SSL on port {port})")
+    print(f"[profiler] Open in browser: {tb_url}")
+    print(f"[profiler] Press Ctrl+C to stop.\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[profiler] TensorBoard stopped.")
+    finally:
+        server.shutdown()
+        tb_proc.terminate()
+        tb_proc.wait(timeout=5)
+
+
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    # Parse profiler-specific args before the training script
+    tb_url = None
+    argv = sys.argv[1:]
+    while argv and argv[0].startswith("--"):
+        if argv[0] == "--load-tensorboard" and len(argv) > 1:
+            tb_url = argv[1]
+            argv = argv[2:]
+        elif argv[0] == "--tensorboard-url" and len(argv) > 1:
+            tb_url = argv[1]
+            argv = argv[2:]
+        else:
+            break
+
+    # --load-tensorboard with no training script = just serve existing logs
+    if tb_url and (not argv or argv[0] in ("-h", "--help")):
+        tb_dir = os.path.join(OUTDIR, "tensorboard")
+        if not os.path.exists(tb_dir):
+            print(f"Error: no tensorboard logs found at {tb_dir}")
+            print(f"Run profiling first, or set PROFILE_OUTPUT_DIR to the correct path.")
+            sys.exit(1)
+        _run_tensorboard(tb_url, tb_dir)
+        sys.exit(0)
+
+    if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         sys.exit(0)
 
-    script = sys.argv[1]
+    script = argv[0]
+    sys.argv = argv
     if not Path(script).exists():
         print(f"Error: {script} not found")
         sys.exit(1)
@@ -520,10 +645,15 @@ def main() -> None:
             print(f"\n{'=' * 100}")
             print("HOW TO USE THE OUTPUT")
             print("=" * 100)
-            print(f"  1. TensorBoard (recommended — interactive UI with all views):")
-            print(f"     Remote:  tensorboard --logdir={tb_dir} --port=6006 --bind_all")
-            print(f"     Local:   ssh -L 6006:localhost:6006 <remote-host>")
-            print(f"     Browser: http://localhost:6006/#pytorch_profiler")
+            if tb_url:
+                print(f"  1. TensorBoard will launch after cleanup — open this URL:")
+                print(f"     {tb_url}")
+            else:
+                print(f"  1. TensorBoard (recommended — interactive UI with all views):")
+                print(f"     Remote:  tensorboard --logdir={tb_dir} --port=6006 --bind_all")
+                print(f"     Local:   ssh -L 6006:localhost:6006 <remote-host>")
+                print(f"     Browser: http://localhost:6006/#pytorch_profiler")
+                print(f"     Tip: use --load-tensorboard <proxy-url> to auto-launch after profiling")
             print(f"     -> Overview, Operator, Trace, Memory views all in one place")
             print(f"  2. Chrome trace (manual): {OUTDIR}/trace.json")
             print(f"     -> Open in chrome://tracing  OR  https://ui.perfetto.dev")
@@ -540,6 +670,11 @@ def main() -> None:
 
         # Final cleanup (GPU memory, dist, child processes)
         _cleanup("finally")
+
+        # Launch TensorBoard after everything is cleaned up (foreground, Ctrl+C to stop)
+        if tb_url and IS_MASTER:
+            tb_dir = os.path.join(OUTDIR, "tensorboard")
+            _run_tensorboard(tb_url, tb_dir)
 
 
 if __name__ == "__main__":
