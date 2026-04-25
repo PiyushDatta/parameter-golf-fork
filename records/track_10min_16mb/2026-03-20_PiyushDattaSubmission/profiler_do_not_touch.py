@@ -500,6 +500,18 @@ def main() -> None:
     if "MAX_WALLCLOCK_SECONDS" not in os.environ:
         os.environ["MAX_WALLCLOCK_SECONDS"] = "120"
 
+    # Skip pruning and sliding window eval during profiling — slow and irrelevant to training perf
+    os.environ.setdefault("SKIP_PRUNING", "1")
+    os.environ.setdefault("SKIP_POST_TRAIN_EVAL", "1")
+
+    # Log every 50 steps during profiling so there's visible progress
+    os.environ.setdefault("TRAIN_LOG_EVERY", "50")
+
+    # Enable TensorBoard training metrics (learning efficiency curves)
+    tb_train_dir = os.path.join(OUTDIR, "tensorboard", "train_metrics")
+    os.environ.setdefault("TB_LOG_DIR", tb_train_dir)
+    os.environ.setdefault("VAL_LOSS_EVERY", "50")
+
     # Detect nsys wrapper — warn user they'll lose GPU times
     nsys_detected = any(k.startswith("NSYS_") or k.startswith("__NSYS") for k in os.environ)
     if not nsys_detected:

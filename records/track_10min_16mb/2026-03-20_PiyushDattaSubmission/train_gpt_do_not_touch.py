@@ -23,7 +23,6 @@ try:
 except ImportError:
     _HAS_FA3 = False
 
-
 class Hyperparameters:
     data_dir = os.environ.get("DATA_DIR", "./data/")
     seed = int(os.environ.get("SEED", 1337))
@@ -33,11 +32,11 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 10))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393216))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
-    train_log_every = 500
+    train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 6e2))
     val_batch_tokens = 524288
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
-    val_loss_every = 4000
+    val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     sliding_window_enabled = True
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
@@ -435,18 +434,20 @@ class Block(nn.Module):
     def forward(self, x, x0):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
         if self.parallel:
-            mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor)
+            x_normed = self.attn_norm(x_in)
+            attn_out = self.attn(x_normed)
+            mlp_out = self.mlp(x_normed)
             x_out = (
                 x_in
                 + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
                 + self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
             )
         else:
+            attn_out = self.attn(self.attn_norm(x_in))
             x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
             x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(
-                self.mlp_norm(x_out) * self.ln_scale_factor
+                self.mlp_norm(x_out)
             )
         return x_out
 
@@ -511,6 +512,7 @@ class GPT(nn.Module):
             else None
         )
         self._init_weights()
+        self._absorb_ln_scale()
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -521,6 +523,17 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+
+    @torch.no_grad()
+    def _absorb_ln_scale(self):
+        for block in self.blocks:
+            s = block.ln_scale_factor
+            if s != 1.0:
+                block.attn.c_q.weight.mul_(s)
+                block.attn.c_k.weight.mul_(s)
+                block.attn.c_v.weight.mul_(s)
+                block.mlp.fc.weight.mul_(s)
+            block.ln_scale_factor = 1.0
 
     def forward_logits(self, input_ids):
         x = self.tok_emb(input_ids)
@@ -646,13 +659,15 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
             wd = group.get("weight_decay", 0.0)
+            param_list = [p for p in params]
+            grad_list = []
             curr = 0
-            for p in params:
-                if wd > 0.0:
-                    p.data.mul_(1.0 - lr * wd)
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
+            for p in param_list:
+                grad_list.append(updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype))
                 curr += p.numel()
+            if wd > 0.0:
+                torch._foreach_mul_(param_list, 1.0 - lr * wd)
+            torch._foreach_add_(param_list, grad_list, alpha=-lr)
         return loss
 
 
@@ -949,7 +964,8 @@ def serialize(h, base_model, code):
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = _compress(quant_raw, h.compressor)
-    if len(quant_blob) > target_bytes:
+    skip_prune = bool(int(os.environ.get("SKIP_PRUNING", "0")))
+    if not skip_prune and len(quant_blob) > target_bytes:
         over = len(quant_blob) - target_bytes
         log(f"prune:over by {over} bytes, selective pruning")
         candidates = []
@@ -1246,6 +1262,7 @@ def train_model(h, device, val_data):
         return 1.0
 
     _cur_batch_tokens = [h.train_batch_tokens]
+    _tb_state = [None, None]  # [tb_writer, component_groups] — populated after step_fn is defined
 
     def step_fn(step, lr_scale):
         optimizers.zero_grad_all()
@@ -1267,6 +1284,11 @@ def train_model(h, device, val_data):
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * lr_scale
+        tw, cg = _tb_state
+        if tw and cg and h.val_loss_every > 0 and step % h.val_loss_every == 0:
+            for key, params in cg.items():
+                gn = sum(p.grad.float().norm().item()**2 for p in params if p.grad is not None)**0.5
+                tw.add_scalar(f"grad_norm/{key}", gn, step)
         if h.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), h.grad_clip_norm)
         optimizers.step()
@@ -1296,6 +1318,36 @@ def train_model(h, device, val_data):
     swa_count = 0
     training_time_ms = 0.0
     stop_after_step = None
+    tb_writer = None
+    tb_dir = os.environ.get("TB_LOG_DIR")
+    if tb_dir and h.is_main_process:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=tb_dir)
+    prev_val_bpb = None
+    prev_val_step = None
+    component_groups = None
+    if tb_writer:
+        component_groups = {}
+        for name, p in base_model.named_parameters():
+            if 'tok_emb' in name:
+                key = 'embedding'
+            elif 'blocks.' in name:
+                layer = int(name.split('.')[1])
+                if '.attn.' in name:
+                    key = f'layer{layer:02d}/attn'
+                elif '.mlp.' in name:
+                    key = f'layer{layer:02d}/mlp'
+                else:
+                    key = f'layer{layer:02d}/scale'
+            elif 'skip' in name:
+                key = 'skip'
+            else:
+                key = 'other'
+            if key not in component_groups:
+                component_groups[key] = []
+            component_groups[key].append(p)
+    _tb_state[0] = tb_writer
+    _tb_state[1] = component_groups
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1307,6 +1359,19 @@ def train_model(h, device, val_data):
             training_time_ms += 1e3 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(h, device, val_data, model)
             log(f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}")
+            if tb_writer:
+                tb_writer.add_scalar("val/bpb", val_bpb, step)
+                tb_writer.add_scalar("val/loss", val_loss, step)
+                tokens_seen = step * h.train_batch_tokens
+                tb_writer.add_scalar("val/bpb_vs_tokens", val_bpb, tokens_seen)
+                if prev_val_bpb is not None and step > prev_val_step:
+                    delta_steps = step - prev_val_step
+                    delta_bpb = prev_val_bpb - val_bpb
+                    delta_tokens = delta_steps * h.train_batch_tokens
+                    tb_writer.add_scalar("efficiency/bpb_per_step", delta_bpb / delta_steps, step)
+                    tb_writer.add_scalar("efficiency/bpb_per_M_tokens", delta_bpb / (delta_tokens / 1e6), step)
+                prev_val_bpb = val_bpb
+                prev_val_step = step
             torch.cuda.synchronize()
             t0 = time.perf_counter()
         if last_step:
@@ -1318,26 +1383,36 @@ def train_model(h, device, val_data):
         scale = lr_mul(frac)
         train_loss = step_fn(step, scale)
         with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+            sd = base_model.state_dict()
+            sd_vals = [t.detach().float() for t in sd.values()]
+            ema_vals = [ema_state[name] for name in sd.keys()]
+            torch._foreach_mul_(ema_vals, ema_decay)
+            torch._foreach_add_(ema_vals, sd_vals, alpha=1.0 - ema_decay)
             swa_decay = float(os.environ.get("SWA_DECAY", 0))
             if h.swa_enabled and scale < h.swa_start_frac and step % h.swa_every == 0:
                 if swa_state is None:
-                    swa_state = {name: t.detach().float().clone() for (name, t) in base_model.state_dict().items()}
+                    swa_state = {name: t.detach().float().clone() for (name, t) in sd.items()}
                     swa_count = 1
                 elif swa_decay > 0:
-                    for name, t in base_model.state_dict().items():
-                        swa_state[name].mul_(swa_decay).add_(t.detach().float(), alpha=1.0 - swa_decay)
+                    swa_vals = [swa_state[name] for name in sd.keys()]
+                    torch._foreach_mul_(swa_vals, swa_decay)
+                    torch._foreach_add_(swa_vals, sd_vals, alpha=1.0 - swa_decay)
                     swa_count = 1
                 else:
-                    for name, t in base_model.state_dict().items():
-                        swa_state[name].add_(t.detach().float())
+                    swa_vals = [swa_state[name] for name in sd.keys()]
+                    torch._foreach_add_(swa_vals, sd_vals)
                     swa_count += 1
         step += 1
         approx_training_time_ms = training_time_ms + 1e3 * (time.perf_counter() - t0)
         should_log_train = h.train_log_every > 0 and (
             step <= 5 or step % h.train_log_every == 0 or stop_after_step is not None
         )
+        if tb_writer:
+            tl_val = train_loss.item()
+            tb_writer.add_scalar("train/loss", tl_val, step)
+            tb_writer.add_scalar("train/lr_scale", scale, step)
+            ms_per_step = approx_training_time_ms / step if step > 0 else 0
+            tb_writer.add_scalar("train/ms_per_step", ms_per_step, step)
         if should_log_train:
             tok_per_sec = step * h.train_batch_tokens / (approx_training_time_ms / 1e3)
             log(
@@ -1361,6 +1436,9 @@ def train_model(h, device, val_data):
         log("ema:applying EMA weights")
         avg_state = {name: t.to(dtype=current_state[name].dtype) for (name, t) in ema_state.items()}
     base_model.load_state_dict(avg_state, strict=True)
+    if tb_writer:
+        tb_writer.flush()
+        tb_writer.close()
     return base_model, compiled_model
 
 
@@ -1374,6 +1452,10 @@ def train_and_eval(h, device):
     log(f"val_tokens: {val_data.val_tokens.numel()-1}")
     base_model, compiled_model = train_model(h, device, val_data)
     torch._dynamo.reset()
+    skip_post = bool(int(os.environ.get("SKIP_POST_TRAIN_EVAL", "0")))
+    if skip_post:
+        log("skipping post-train eval (SKIP_POST_TRAIN_EVAL=1)")
+        return
     timed_eval("pre-quantization post-ema", eval_val, h, device, val_data, compiled_model)
     serialize(h, base_model, Path(__file__).read_text(encoding="utf-8"))
     if h.distributed:
