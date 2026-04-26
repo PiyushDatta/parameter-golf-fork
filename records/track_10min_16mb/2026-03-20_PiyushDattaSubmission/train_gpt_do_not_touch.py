@@ -46,7 +46,9 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
-    skip_gates_enabled = True
+    skip_gates_enabled = bool(int(os.environ.get("SKIP_GATES_ENABLED", "1")))
+    skip_enabled = bool(int(os.environ.get("SKIP_ENABLED", "1")))
+    dense_skip = bool(int(os.environ.get("DENSE_SKIP", "0")))
     tie_embeddings = True
     logit_softcap = 3e1
     rope_base = 1e4
@@ -504,13 +506,29 @@ class GPT(nn.Module):
                 self.blocks[i].parallel = True
         self.encoder_indices = list(range(self.num_encoder_layers))
         self.decoder_indices = list(range(self.num_encoder_layers, h.num_layers))
-        self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
-        self.skip_gates = (
-            nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32))
-            if h.skip_gates_enabled
-            else None
-        )
+        self.skip_mode = "none"
+        n_enc = self.num_encoder_layers
+        n_dec = self.num_decoder_layers
+        if h.skip_enabled and h.dense_skip:
+            self.skip_mode = "dense"
+            self.dense_skip_weights = nn.Parameter(
+                torch.ones(n_dec, n_enc, h.model_dim, dtype=torch.float32)
+            )
+            gate_init = torch.full((n_dec, n_enc, h.model_dim), -5.0, dtype=torch.float32)
+            for d in range(min(n_enc, n_dec)):
+                gate_init[d, n_enc - 1 - d, :] = 0.0
+            self.dense_skip_gates = (
+                nn.Parameter(gate_init) if h.skip_gates_enabled else None
+            )
+        elif h.skip_enabled:
+            self.skip_mode = "sparse"
+            self.num_skip_weights = min(n_enc, n_dec)
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
+            self.skip_gates = (
+                nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32))
+                if h.skip_gates_enabled
+                else None
+            )
         self._init_weights()
         self._absorb_ln_scale()
 
@@ -541,21 +559,39 @@ class GPT(nn.Module):
         if self.embed_proj is not None:
             x = self.embed_proj(x)
         x0 = x
-        skips = []
-        enc_iter = range(self.num_encoder_layers)
-        dec_iter = range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
-        for i in enc_iter:
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for skip_idx, i in enumerate(dec_iter):
-            if skip_idx < self.num_skip_weights and skips:
-                scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                if self.skip_gates is not None:
-                    g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
-                    x = torch.lerp(scaled_skip, x, g)
-                else:
-                    x = x + scaled_skip
-            x = self.blocks[i](x, x0)
+        if self.skip_mode == "dense":
+            enc_outputs = []
+            for i in self.encoder_indices:
+                x = self.blocks[i](x, x0)
+                enc_outputs.append(x)
+            for d, i in enumerate(self.decoder_indices):
+                skip_sum = torch.zeros_like(x)
+                for e in range(len(enc_outputs)):
+                    w = self.dense_skip_weights[d, e].to(dtype=x.dtype)[None, None, :]
+                    if self.dense_skip_gates is not None:
+                        g = torch.sigmoid(self.dense_skip_gates[d, e].to(dtype=x.dtype))[None, None, :]
+                        skip_sum = skip_sum + g * w * enc_outputs[e]
+                    else:
+                        skip_sum = skip_sum + w * enc_outputs[e]
+                x = x + skip_sum
+                x = self.blocks[i](x, x0)
+        elif self.skip_mode == "sparse":
+            skips = []
+            for i in self.encoder_indices:
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for skip_idx, i in enumerate(self.decoder_indices):
+                if skip_idx < self.num_skip_weights and skips:
+                    scaled_skip = self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                    if self.skip_gates is not None:
+                        g = torch.sigmoid(self.skip_gates[skip_idx].to(dtype=x.dtype))[None, None, :]
+                        x = torch.lerp(scaled_skip, x, g)
+                    else:
+                        x = x + scaled_skip
+                x = self.blocks[i](x, x0)
+        else:
+            for i in range(len(self.blocks)):
+                x = self.blocks[i](x, x0)
         x = self.final_norm(x)
         if self.head_proj is not None:
             x = self.head_proj(x)
@@ -675,7 +711,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,dense_skip_weights,dense_skip_gates",
     ).split(",")
     if pattern
 )
@@ -694,10 +730,16 @@ class Optimizers:
             for (name, p) in block_named_params
             if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
-        if base_model.skip_weights.numel() > 0:
-            scalar_params.append(base_model.skip_weights)
-        if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
-            scalar_params.append(base_model.skip_gates)
+        if base_model.skip_mode == "dense":
+            if base_model.dense_skip_weights.numel() > 0:
+                scalar_params.append(base_model.dense_skip_weights)
+            if base_model.dense_skip_gates is not None and base_model.dense_skip_gates.numel() > 0:
+                scalar_params.append(base_model.dense_skip_gates)
+        elif base_model.skip_mode == "sparse":
+            if base_model.skip_weights.numel() > 0:
+                scalar_params.append(base_model.skip_weights)
+            if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
+                scalar_params.append(base_model.skip_gates)
         token_lr = h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
         self.optimizer_tok = torch.optim.AdamW(
