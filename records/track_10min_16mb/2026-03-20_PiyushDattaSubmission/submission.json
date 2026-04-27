@@ -1,31 +1,19 @@
 {
   "author": "Piyush Datta",
   "github_id": "PiyushDatta",
-  "name": "SP8192 SOTA-Adapted with SWA + Half-Batch for Limited Hardware",
-  "blurb": "SOTA-adapted architecture (SP8192, MLP4x, MuonEq-R, SDClip GPTQ, parallel residuals) with SWA and half-batch (393K tokens/step for 2x more steps). Key findings: SWA >> EMA below ~1100 steps (0.045 bpb), half-batch gives -0.006 bpb via 2x more steps.",
-  "date": "2026-04-13",
-  "val_bpb": 1.1617,
-  "val_bpb_std": 0.0010,
-  "seeds": [42, 137, 7],
-  "seed_results": {
-    "42": {"sliding_bpb": 1.1608, "post_gptq": 1.1770, "size": 15997000},
-    "137": {"sliding_bpb": 1.1627, "post_gptq": 1.1789, "size": 15998000},
-    "7": {"sliding_bpb": 1.1616, "post_gptq": 1.1786, "size": 15997000}
-  },
-  "hardware": "4xA100 80GB",
-  "training_steps": 1912,
-  "ms_per_step": 307,
-  "bytes_total": 15997000,
-  "bytes_code": 15600,
-  "train_batch_tokens": 393216,
-  "techniques": [
-    "SP8192 tokenizer",
-    "MLP 4.0x with LZMA code compression",
-    "Half-batch (393K tokens/step for 2x more steps)",
-    "MuonEq-R (row-normalized Muon)",
-    "SDClip GPTQ (int6 matrix, int8 embed)",
-    "Parallel residuals (layer 7+)",
-    "SWA (131 warmdown checkpoints)",
-    "Brotli-11 compression with byte-shuffle"
-  ]
+  "name": "SP8192 Depth Recurrence + Polar Express + Stacked SOTA on 4xA100",
+  "blurb": "SP8192, 11L MLP4x, depth recurrence (NUM_LOOPS=1, layers 3-5), parallel residuals, Polar Express NS, MuonEq-R, SDClip GPTQ (int6+int8 embed, HESSIAN_CLIP_LAMBDA=0.175), brotli, SWA (157 ckpts, SWA_EVERY=1, warmdown=0.72, MIN_LR=0.10), half-batch (393K), score-first TTT (SGD lr=0.02, 1 epoch, 64K chunks).",
+  "date": "2026-04-27T00:00:00Z",
+  "track": "non-record-16mb",
+  "val_bpb": 1.14237,
+  "val_bpb_std": 0.00071,
+  "seeds_sliding": {"42": 1.14208, "1337": 1.14187, "999": 1.14317},
+  "seeds_sliding_mean": 1.14237,
+  "val_bpb_full_ttt_seed1337": 1.14127,
+  "val_bpb_fast_ttt_seed1337": 1.14210,
+  "step_stop": 2037,
+  "wallclock_seconds": 600,
+  "bytes_total": 15995429,
+  "bytes_code": 21091,
+  "gpu": "4xA100 80GB"
 }
