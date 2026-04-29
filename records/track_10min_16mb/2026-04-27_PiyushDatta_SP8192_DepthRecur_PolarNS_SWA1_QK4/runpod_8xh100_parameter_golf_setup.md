@@ -99,23 +99,44 @@ export TRITON_CACHE_DIR=/workspace/triton-cache
 rm -rf /dev/shm/torchinductor_root /dev/shm/triton
 
 /workspace/uv-envs/parameter-golf/bin/python \
-  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/generate_submission_logs.py \
-  --nproc 8
+  records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4/generate_submission_logs.py \
+  --nproc 8 \
+  --data-dir /dev/shm/parameter-golf-fork/data/
 ```
 
 This will:
-1. Run training with 3 seeds (42, 137, 7) sequentially
+1. Run training with 3 seeds (42, 314, 999) sequentially
 2. Save per-seed logs to `records/.../logs/seed_42.log`, etc.
 3. Parse all results and write `records/.../logs/summary.json`
 4. Print a summary table with mean/std val_bpb and artifact sizes
 
+All config defaults are baked into `train_gpt.py` — no env vars needed.
+
 Each seed takes ~12-15 min (10 min training + GPTQ + eval). Total: ~40-45 min.
+
+**Key defaults baked into train_gpt.py:**
+- `MATRIX_LR=0.028` (optimized for Polar Express NS)
+- `MUON_WD=0.095, EMBED_WD=0.085`
+- `NUM_LOOPS=1, ENABLE_LOOPING_AT=0.45` (depth recurrence)
+- `SWA_EVERY=1, MIN_LR=0.10, SWA_START_FRAC=0.12`
+- `WARMUP_STEPS=20, QK_GAIN_INIT=4.0`
+- `HESSIAN_CLIP_LAMBDA=0.175`
+- Polar Express Newton-Schulz coefficients
+
+**For 8xH100 optimized config** (different from baked defaults):
+```bash
+/workspace/uv-envs/parameter-golf/bin/python \
+  records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4/generate_submission_logs.py \
+  --nproc 8 \
+  --data-dir /dev/shm/parameter-golf-fork/data/ \
+  --env "NUM_LOOPS=2,ENABLE_LOOPING_AT=0.35,LOOP_START=4,LOOP_END=5,TRAIN_BATCH_TOKENS=786432,MUON_MOMENTUM=0.99,MUON_MOMENTUM_WARMUP_START=0.92,MUON_MOMENTUM_WARMUP_STEPS=1500,MATRIX_LR=0.022,SWA_ENABLED=0,GPTQ_RESERVE_SECONDS=12,TTT_LR=0.005,MIN_LR=0.0,QK_GAIN_INIT=5.25"
+```
 
 **Dry run** (preview commands without running):
 
 ```bash
 /workspace/uv-envs/parameter-golf/bin/python \
-  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/generate_submission_logs.py \
+  records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4/generate_submission_logs.py \
   --nproc 8 --dry-run
 ```
 
@@ -123,8 +144,9 @@ Each seed takes ~12-15 min (10 min training + GPTQ + eval). Total: ~40-45 min.
 
 ```bash
 /workspace/uv-envs/parameter-golf/bin/python \
-  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/generate_submission_logs.py \
-  --nproc 8 --seeds 42
+  records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4/generate_submission_logs.py \
+  --nproc 8 --seeds 42 \
+  --data-dir /dev/shm/parameter-golf-fork/data/
 ```
 
 ---
@@ -139,7 +161,7 @@ cd /dev/shm/parameter-golf-fork
 # Set up env vars as in step 7 above, then:
 DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=8 \
-  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/train_gpt.py
+  records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4/train_gpt.py
 ```
 
 To save the console stream:
@@ -147,7 +169,7 @@ To save the console stream:
 ```bash
 DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distributed.run \
   --standalone --nproc_per_node=8 \
-  records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid/train_gpt.py \
+  records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4/train_gpt.py \
   2>&1 | tee /dev/shm/pg-logs/train_console.log
 ```
 
@@ -158,14 +180,14 @@ DATA_DIR=./data /workspace/uv-envs/parameter-golf/bin/python -m torch.distribute
 Because `/dev/shm` is temporary, copy logs back out after the run.
 
 **If you used `generate_submission_logs.py`** (step 7), logs are already at:
--   `records/.../logs/seed_42.log`, `seed_137.log`, `seed_7.log`
+-   `records/.../logs/seed_42.log`, `seed_314.log`, `seed_999.log`
 -   `records/.../logs/summary.json` (parsed results with mean/std)
 
 Copy the whole submission directory to `/workspace`:
 
 ```bash
 mkdir -p /workspace/pg-results
-cp -r /dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-04-17_PiyushDatta_SP8192_SWA_HalfBatch_MLP4x_ParResid /workspace/pg-results/
+cp -r /dev/shm/parameter-golf-fork/records/track_10min_16mb/2026-04-27_PiyushDatta_SP8192_DepthRecur_PolarNS_SWA1_QK4 /workspace/pg-results/
 ```
 
 **If you ran manually** (step 7b), grab the latest log:
