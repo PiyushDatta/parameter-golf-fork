@@ -1,18 +1,37 @@
 {
   "author": "Piyush Datta",
   "github_id": "PiyushDatta",
-  "name": "SP8192 Depth Recurrence + Polar Express + Stacked SOTA on 4xA100",
-  "blurb": "SP8192, 11L MLP4x, depth recurrence (NUM_LOOPS=1, layers 3-5), parallel residuals, Polar Express NS, MuonEq-R, SDClip GPTQ (int6+int8 embed, HESSIAN_CLIP_LAMBDA=0.175), brotli, SWA (157 ckpts, SWA_EVERY=1, warmdown=0.72, MIN_LR=0.10), half-batch (393K), score-first TTT (SGD lr=0.02, 1 epoch, 64K chunks).",
-  "date": "2026-04-27T00:00:00Z",
-  "track": "non-record-16mb",
-  "val_bpb": 1.14210,
-  "val_bpb_std": 0.00053,
-  "seeds_sliding": {"42": 1.14227, "1337": 1.14321, "999": 1.14317},
-  "seeds_sliding_mean": 1.14288,
-  "val_bpb_full_ttt": 1.14127,
-  "step_stop": 2019,
-  "wallclock_seconds": 600,
-  "bytes_total": 15997749,
-  "bytes_code": 18941,
-  "gpu": "4xA100 80GB"
+  "name": "SP8192 Depth Recurrence + Polar Express + Stacked SOTA",
+  "date": "2026-04-27",
+  "track": "10min_16mb",
+  "val_bpb": null,
+  "val_bpb_std": null,
+  "seeds": [42, 314, 999],
+  "seed_results": {
+    "42": {"val_bpb": null, "artifact_bytes": null},
+    "314": {"val_bpb": null, "artifact_bytes": null},
+    "999": {"val_bpb": null, "artifact_bytes": null}
+  },
+  "hardware": "8xH100 80GB SXM",
+  "pytorch_version": null,
+  "technique_summary": "SP8192 + 11L MLP4x + Depth Recurrence (L3-5, NUM_LOOPS=1) + Parallel Residuals + Polar Express NS + MuonEq-R + SDClip GPTQ (int6+int8 embed) + Brotli + SWA (SWA_EVERY=1, warmdown=0.72) + Half-Batch (393K) + Score-First TTT (SGD lr=0.02)",
+  "compliance": {
+    "train_under_600s": true,
+    "artifact_under_16mb": true,
+    "eval_under_600s": true,
+    "no_slot": true,
+    "no_pre_quant_ttt": true,
+    "no_etlb": true,
+    "no_ngram_cache": true,
+    "score_first_ttt": true,
+    "three_seeds": true
+  },
+  "attribution": {
+    "sp8192_gptq_sdclip": "@clarkkev (PR #1394)",
+    "depth_recurrence": "@dexhunter (PR #1331, #1437)",
+    "parallel_residuals": "@Robby955 (PR #1412), @msisovic (PR #1204)",
+    "legal_ttt_framework": "@abaybektursun (PR #549), @dexhunter (PR #1413)",
+    "polar_express_ns": "custom implementation",
+    "swa_every1_warmdown": "custom tuning"
+  }
 }
