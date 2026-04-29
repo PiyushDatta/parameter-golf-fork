@@ -3,10 +3,12 @@
 # Use on 8xH100: bash run_3seeds.sh
 # Use on 4xA100: NPROC=4 bash run_3seeds.sh
 
-set -e
+set -euo pipefail
 
 NPROC=${NPROC:-8}
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PYTHON=${PYTHON:-python}
+TORCHRUN=${TORCHRUN:-"$PYTHON -m torch.distributed.run"}
 
 echo "=== Parameter Golf 3-Seed Submission Run ==="
 echo "GPUs: $NPROC"
@@ -23,7 +25,7 @@ for SEED in 42 314 999; do
     TTT_EPOCHS=1 \
     TTT_CHUNK_TOKENS=65536 \
     DATA_DIR=./data/ \
-    torchrun --standalone --nproc_per_node=$NPROC \
+    $TORCHRUN --standalone --nproc_per_node=$NPROC \
         "$SCRIPT_DIR/train_gpt.py" \
         2>&1 | tee "$SCRIPT_DIR/train_seed${SEED}.log"
 
