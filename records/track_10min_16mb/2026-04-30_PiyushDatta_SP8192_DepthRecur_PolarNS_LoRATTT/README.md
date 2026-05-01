@@ -4,7 +4,7 @@
 
 11-layer GPT with SP8192 tokenizer, MLP 4x, depth recurrence (layers 3-5 looped once), parallel residuals, Polar Express Newton-Schulz optimizer, and phased LoRA test-time training.
 
-**val_bpb: TBD** (3-seed mean, 8xH100)
+**val_bpb: 1.09085** (3-seed mean, 8xH100, quantized sliding window)
 
 ## Key Techniques
 
@@ -51,10 +51,10 @@
 ```bash
 # On 8xH100:
 cd /workspace/parameter-golf
-bash records/track_10min_16mb/2026-04-30_PiyushDatta_FinalSubmission/run_final_submission.sh
+bash records/track_10min_16mb/2026-04-30_PiyushDatta_SP8192_DepthRecur_PolarNS_LoRATTT/run_final_submission.sh
 
 # On 4xA100 (local testing, TTT will be slow):
-NPROC=4 bash records/track_10min_16mb/2026-04-30_PiyushDatta_FinalSubmission/run_final_submission.sh
+NPROC=4 bash records/track_10min_16mb/2026-04-30_PiyushDatta_SP8192_DepthRecur_PolarNS_LoRATTT/run_final_submission.sh
 ```
 
 ## Attribution
